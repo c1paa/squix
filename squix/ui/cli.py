@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import os
 import shutil
 import sys
@@ -179,7 +178,6 @@ class ThemePicker:
 
     def run(self) -> str | None:
         from prompt_toolkit.application import Application
-        from prompt_toolkit.formatted_text import HTML
         from prompt_toolkit.layout import FormattedTextControl, Layout, Window
         from prompt_toolkit.layout.containers import HSplit
         from prompt_toolkit.layout.dimension import Dimension
@@ -472,52 +470,112 @@ class SquixCLI:
     # ------------------------------------------------------------------ #
 
     async def _handle_input(self, text: str) -> None:
-        """Process user input through the agent system."""
+        """Process user input through the agent system, respecting current mode."""
         th = self._th()
 
         # Show what user typed
         console.print(f"[dim]You:[/dim] {text}")
         console.print()
 
-        # Show working indicator
-        active_chain = self.engine.get_active_chain()
-
         try:
-            # Process through Talk agent → full pipeline
-            with console.status("[bold green]Thinking...", spinner="dots"):
-                results = await self.engine.process_input(text)
+            mode = self.current_mode
+
+            if mode == "talk":
+                # Talk mode: direct LLM chat, no classification, no delegation
+                with console.status("[bold green]Chatting...", spinner="dots"):
+                    results = await self.engine.chat_only(text)
+
+            elif mode == "plan":
+                # Plan mode: show what WOULD happen but don't execute
+                with console.status("[bold yellow]Planning...", spinner="dots"):
+                    results = await self.engine.plan_only(text)
+
+            elif mode == "interactive":
+                # Interactive mode: run pipeline, display intermediate steps
+                # The engine returns all messages including delegation info
+                with console.status("[bold green]Thinking...", spinner="dots"):
+                    results = await self.engine.process_input(text)
+
+            else:
+                # Auto mode (default): full pipeline, no questions asked
+                with console.status("[bold green]Thinking...", spinner="dots"):
+                    results = await self.engine.process_input(text)
 
             if not results:
                 console.print("[dim]No response.[/dim]")
                 console.print()
                 return
 
-            # Display results
+            # Display results in Claude Code-like pipeline format
+            pipeline_steps = []
+            final_content = ""
+
             for msg in results:
                 msg_type = msg.metadata.get("type", "")
                 sender = msg.sender
 
                 if msg_type == "error":
-                    self.print_msg(
-                        f"Error ({sender})",
-                        msg.content,
-                        color=th["error_color"],
-                        border=th["error_border"],
-                    )
+                    # Show error inline immediately
+                    console.print(f"  [bold red]ERROR ({sender}):[/bold red] {msg.content}")
+                    pipeline_steps.append(("error", msg.content))
+
                 elif msg_type == "chat":
-                    # Direct chat response from talk
-                    self.print_msg("Squix", msg.content,
-                                   color=th["agent_color"], border=th["agent_border"])
+                    # Direct chat response — show as user-facing result
+                    final_content = msg.content
+
+                elif msg_type == "routing":
+                    # Pipeline step: agent A → agent B
+                    target = msg.metadata.get("to", sender)
+                    preview = msg.content[:80]
+                    pipeline_steps.append(
+                        ("handoff", f"{sender} → {target}: {preview}")
+                    )
+                    # Show each step as it happens
+                    step_icon = "[bold yellow]→[/bold yellow]"
+                    console.print(f"  {step_icon} [dim]{sender}[/dim] → [bold]{target}[/bold]")
+                    console.print(f"    [dim]{msg.content[:120]}[/dim]")
+
+                elif msg_type == "delegate":
+                    # Task delegation notification — show as pipeline start
+                    worker = msg.recipient
+                    pipeline_steps.append(
+                        ("dispatch", f"Dispatching to {worker}")
+                    )
+                    console.print(
+                        f"  [bold blue]⚙ Dispatching:[/bold blue] [dim]→ {worker}[/dim]"
+                    )
+
                 elif msg_type == "final_result":
-                    # Task pipeline result
-                    self.print_msg(f"Result ({sender})", msg.content,
-                                   color=th["agent_color"], border=th["agent_border"])
+                    # Final result — this is the answer
+                    final_content = msg.content
+
                 elif msg_type == "result":
-                    self.print_msg(f"{sender}", msg.content,
-                                   color=th["agent_color"], border=th["agent_border"])
+                    # Intermediate result from worker
+                    final_content = msg.content
+                    pipeline_steps.append(("result", msg.content[:200]))
+
                 else:
-                    self.print_msg(sender, msg.content,
-                                   color=th["agent_color"], border=th["agent_border"])
+                    # Catch-all: add to pipeline if not empty
+                    if msg.content and msg.content.strip():
+                        pipeline_steps.append(("other", msg.content[:200]))
+                        # Use as fallback final content if nothing else set
+                        if not final_content:
+                            final_content = msg.content[:500]
+
+            # If we have pipeline steps but no explicit final content,
+            # use the last step's content as the result
+            if not final_content and pipeline_steps:
+                last_step = pipeline_steps[-1]
+                final_content = last_step[1]
+
+            # Show final pipeline result box
+            if final_content:
+                console.print()
+                self.print_msg("Result", final_content,
+                               color=th["agent_color"], border=th["agent_border"])
+
+            elif not pipeline_steps:
+                console.print("[dim]No response.[/dim]")
 
             # Show cost if any
             if self.engine.cost_tracker.total_cost > 0:

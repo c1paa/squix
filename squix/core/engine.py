@@ -16,12 +16,15 @@ from squix.models.registry import ModelRegistry
 from squix.observability.cost_tracker import CostTracker
 from squix.observability.logger import SquixLogger
 from squix.policy.engine import PolicyEngine
+from squix.skills.registry import SkillRegistry
 from squix.workspace.manager import WorkspaceManager
+from squix.workspace.primary_file_tracker import PrimaryFileTracker
 
 logger = logging.getLogger("squix.core.engine")
 
 # Default timeout for waiting on agent responses (seconds)
-_STEP_TIMEOUT = 60
+STEP_TIMEOUT = 30
+DELEGATION_TIMEOUT = 5
 
 
 class SquixEngine:
@@ -54,12 +57,14 @@ class SquixEngine:
             self.config.get("agents", []),
             self.config.get("agent_links", {}),
         )
+        self.primary_tracker = PrimaryFileTracker(self.project_dir)
+        self.skills = SkillRegistry(workspace=self.workspace, primary_tracker=self.primary_tracker)
         self.agents: dict[str, Any] = {}
         self._tasks: list[asyncio.Task] = []
         # Result queue — agents put final results here for engine to collect
         self._result_queue: asyncio.Queue[AgentMessage] = asyncio.Queue()
-        # Event callback for UI to show real-time agent activity
-        self._on_agent_event: Any = None
+        # Progress callback for live execution UX: (agent_id, text, task_id) -> None
+        self._progress_cb: Any = None
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -95,6 +100,9 @@ class SquixEngine:
             result_queue=self._result_queue,
             cost_tracker=self.cost_tracker,
             policy=self.policy,
+            workspace_manager=self.workspace,
+            skills=self.skills,
+            primary_tracker=self.primary_tracker,
         )
         self.logger.system(f"Agents loaded: {list(self.agents.keys())}")
 
@@ -129,7 +137,11 @@ class SquixEngine:
     # ------------------------------------------------------------------
 
     async def _route_message(self, msg: AgentMessage) -> None:
-        """Route a message from one agent to another via their inbox queues."""
+        """Route a message from one agent to another via their inbox queues.
+
+        Also mirrors delegation messages into the result queue so the UI
+        sees the plan immediately without waiting for downstream agents.
+        """
         recipient = msg.recipient
         if recipient == "user":
             await self._result_queue.put(msg)
@@ -150,8 +162,29 @@ class SquixEngine:
         })
 
         # Notify UI about agent activity
-        if self._on_agent_event:
-            self._on_agent_event(msg.sender, recipient, "routing")
+        if self._progress_cb:
+            await self._progress_cb(
+                agent_id=msg.sender,
+                text=f"→ {recipient}",
+                task_id=msg.task_id,
+            )
+
+        # Put delegation/forwarding info into the result queue so the UI
+        # sees the plan immediately. Use a metadata copy so as not to
+        # mutate the original message.
+        routing_note = msg.metadata.copy()
+        routing_note.update({
+            "type": "routing",
+            "from": msg.sender,
+            "to": recipient,
+        })
+        await self._result_queue.put(AgentMessage(
+            sender=msg.sender,
+            recipient="user",
+            content=f"→ {recipient}: {msg.content}",
+            task_id=msg.task_id,
+            metadata=routing_note,
+        ))
 
         await agent.put_message(msg)
 
@@ -160,7 +193,7 @@ class SquixEngine:
     # ------------------------------------------------------------------
 
     async def process_input(self, user_input: str) -> list[AgentMessage]:
-        """Process user input through the Talk agent and collect all results.
+        """Process user input through the Talk agent (auto mode).
 
         Talk classifies the input and either responds directly or delegates
         to other agents. Results flow back through the result queue.
@@ -203,7 +236,7 @@ class SquixEngine:
         results: list[AgentMessage] = []
         try:
             results = await self._collect_results(task_id)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             results.append(AgentMessage(
                 sender="system",
                 recipient="user",
@@ -220,55 +253,242 @@ class SquixEngine:
         self.logger.task_completed(task_id)
         return results
 
-    async def _collect_results(self, task_id: str) -> list[AgentMessage]:
-        """Collect results from the result queue for a specific task.
+    async def chat_only(self, user_input: str) -> list[AgentMessage]:
+        """Direct LLM chat response — no delegation, no pipeline.
 
-        Waits for results with a timeout. Stops when:
-        - A final result (type=chat or type=result) is received
-        - Or timeout is reached
+        Used in Talk Mode: bypasses classification and talks directly.
+        """
+        task_id = self.session.next_task_id() if self.session else "t001"
+        if self.session:
+            self.session.add_task(task_id, user_input)
+
+        model_ids = self.registry.get_model_ids()
+        model_id = model_ids[0] if model_ids else "default"
+        adapter = self.registry.get_adapter(model_id)
+        if adapter is None:
+            return [AgentMessage(
+                sender="system", recipient="user",
+                content="[no model available]",
+                task_id=task_id, metadata={"type": "error"},
+            )]
+
+        import re
+        system_prompt = (
+            "You are Squix — a helpful AI assistant. "
+            "Answer concisely and naturally. "
+            "If you don't know something, say so briefly."
+        )
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_input},
+        ]
+
+        try:
+            resp = await adapter.chat(messages, temperature=0.7, max_tokens=1024)
+            text = resp.text.strip()
+            text = re.sub(r"^['\"\u201c\u201d]", "", text).strip()
+            text = re.sub(r"['\"\u201d]\s*$", "", text).strip()
+            # Track cost
+            self.cost_tracker.record(
+                model_id=model_id,
+                input_tokens=resp.input_tokens,
+                output_tokens=resp.output_tokens,
+                cost=resp.cost,
+            )
+            if self.session:
+                self.session.complete_task(task_id)
+                await self.memory.save_session(self.session)
+            return [AgentMessage(
+                sender="squix", recipient="user",
+                content=text, task_id=task_id,
+                metadata={"type": "chat", "model": model_id},
+            )]
+        except Exception as e:
+            return [AgentMessage(
+                sender="system", recipient="user",
+                content=f"[error] {e}", task_id=task_id,
+                metadata={"type": "error"},
+            )]
+
+    async def plan_only(self, user_input: str) -> list[AgentMessage]:
+        """Get plan from Talk agent but do NOT delegate to workers.
+
+        Used in Plan Mode: show what WOULD happen without executing.
+        """
+        task_id = self.session.next_task_id() if self.session else "t001"
+        if self.session:
+            self.session.add_task(task_id, user_input)
+
+        # Send to Talk for classification only
+        msg = AgentMessage(
+            sender="user", recipient="talk",
+            content=user_input, task_id=task_id,
+        )
+        talk_agent = self.agents.get("talk")
+        if talk_agent is None:
+            return [AgentMessage(
+                sender="system", recipient="user",
+                content="[error] Talk agent not available",
+                task_id=task_id, metadata={"type": "error"},
+            )]
+
+        await talk_agent.put_message(msg)
+
+        try:
+            results = await asyncio.wait_for(
+                self._collect_results_plan_mode(task_id), timeout=STEP_TIMEOUT,
+            )
+        except TimeoutError:
+            results = [AgentMessage(
+                sender="system", recipient="user",
+                content="[timeout]", task_id=task_id,
+                metadata={"type": "error"},
+            )]
+
+        # If Talk delegated, annotate: show plan but mark as "not executed"
+        final: list[AgentMessage] = []
+        for r in results:
+            rtype = r.metadata.get("type", "")
+            if rtype == "delegate":
+                # Talk wanted to delegate — show what it planned
+                target = r.recipient
+                final.append(AgentMessage(
+                    sender="plan", recipient="user",
+                    content=f"Would delegate to: {target}\nTask: {r.content}",
+                    task_id=task_id,
+                    metadata={"type": "result", "plan_only": True},
+                ))
+                break
+            elif rtype == "chat":
+                # Talk responded directly — pass through as-is
+                final.append(r)
+            else:
+                final.append(r)
+
+        if self.session:
+            self.session.complete_task(task_id)
+            await self.memory.save_session(self.session)
+        return final
+
+    async def _collect_results_plan_mode(self, task_id: str) -> list[AgentMessage]:
+        """Collect results for plan mode — breaks at delegate type.
+
+        Unlike _collect_results, for plan_mode we want to see the delegation
+        decision immediately, not wait for the actual worker execution.
         """
         results: list[AgentMessage] = []
-        # Keep collecting until we get a final result or timeout
-        deadline = _STEP_TIMEOUT
+        deadline = 5  # short — we just need the classification
+
         while True:
             try:
                 msg = await asyncio.wait_for(
-                    self._result_queue.get(), timeout=deadline
+                    self._result_queue.get(), timeout=deadline,
                 )
-                # Only collect messages for this task (or accept all if task_id empty)
+                if msg.task_id and msg.task_id != task_id:
+                    continue
+                results.append(msg)
+                msg_type = msg.metadata.get("type", "")
+
+                # Break at chat, error, final_result, or delegate
+                if msg_type in ("chat", "error", "final_result", "delegate"):
+                    break
+
+            except TimeoutError:
+                if results:
+                    break
+                raise
+
+        return results
+
+    async def interactive_steps(self, user_input: str) -> list[AgentMessage]:
+        """Process input step-by-step, asking confirmation before each worker.
+
+        Used in Interactive Mode: user approves each worker before execution.
+        The CLI will display intermediate plans and prompt for y/n.
+        For Talk, we still classify first; delegation results indicate what
+        steps would run, and the CLI handles the interactive flow separately.
+        """
+        # For now, same pipeline but results include per-step granularity
+        # The CLI will display these and ask the user. Actual per-step
+        # confirmation is handled in the CLI (it sees delegation results).
+        return await self.process_input(user_input)
+
+    async def _collect_results(self, task_id: str) -> list[AgentMessage]:
+        """Collect results from the result queue for a specific task.
+
+        Stops when:
+        - A final result (type=final_result) is received
+        - A chat response (type=chat) is received
+        - An error (type=error) is received
+        - Or overall timeout is reached
+
+        NOTE: type=delegate is NOT a stop condition — it means work just started.
+        We continue waiting until an actual result or final_result arrives.
+        """
+        results: list[AgentMessage] = []
+        # Total deadline for the whole task (multi-agent pipeline can be slow)
+        overall_deadline = 120  # 2 minutes max for complex tasks
+        deadline = STEP_TIMEOUT  # initial wait
+        routing_received = False
+        started = asyncio.get_event_loop().time()
+
+        while True:
+            elapsed = asyncio.get_event_loop().time() - started
+            remaining = max(0, overall_deadline - elapsed)
+            if remaining <= 0:
+                break
+
+            try:
+                msg = await asyncio.wait_for(
+                    self._result_queue.get(),
+                    timeout=min(deadline, remaining),
+                )
                 if msg.task_id and msg.task_id != task_id:
                     continue
                 results.append(msg)
 
                 msg_type = msg.metadata.get("type", "")
 
-                # If it's a direct chat response from talk, we're done
-                if msg_type == "chat":
+                if msg_type in ("chat", "error", "final_result"):
                     break
 
-                # If it's an error, we're done
-                if msg_type == "error":
-                    break
-
-                # If it's a final result from orch, we're done
-                if msg_type == "final_result":
-                    break
-
-                # If it's a delegation result (intermediate), continue collecting
-                # but with shorter timeout for subsequent results
-                if msg_type == "result":
-                    # This is a worker result — might be followed by more
-                    # Give 5s for more results, then stop
-                    deadline = 5
+                if msg_type == "delegate":
+                    # Delegation means work just started — don't break!
+                    routing_received = True
+                    deadline = 120  # Full pipeline: worker → orch → user
                     continue
 
-                # For other types, keep waiting with shorter timeout
-                deadline = _STEP_TIMEOUT
+                if msg_type == "routing":
+                    routing_received = True
+                    deadline = 120  # Allow multi-hop worker→orch→user flow
+                    continue
 
-            except asyncio.TimeoutError:
+                if msg_type == "result":
+                    deadline = 60
+                    continue
+
+                deadline = STEP_TIMEOUT
+
+            except TimeoutError:
                 if results:
                     break
                 raise
+
+        # If we got a routing/delegate notice but no final result, add a summary
+        if routing_received and not any(
+            r.metadata.get("type") in ("final_result", "chat", "error")
+            for r in results
+        ):
+            results.append(AgentMessage(
+                sender="system",
+                recipient="user",
+                content=(
+                    "[task dispatched to worker — processing your request, "
+                    "result will follow on next turn]"
+                ),
+                task_id=task_id,
+                metadata={"type": "final_result", "summary": True},
+            ))
 
         return results
 

@@ -54,6 +54,10 @@ class AgentFactory:
         result_queue: asyncio.Queue | None = None,
         cost_tracker: Any = None,
         policy: Any = None,
+        workspace_manager: Any = None,
+        skills: Any = None,
+        task_state: Any = None,
+        primary_tracker: Any = None,
     ) -> dict[str, BaseAgent]:
         """Create all enabled agents with full wiring."""
         agents: dict[str, BaseAgent] = {}
@@ -77,6 +81,10 @@ class AgentFactory:
                     result_queue=result_queue,
                     cost_tracker=cost_tracker,
                     policy=policy,
+                    workspace_manager=workspace_manager,
+                    skills=skills,
+                    task_state=task_state,
+                    primary_tracker=primary_tracker,
                 )
                 agents[agent_id] = agent
 

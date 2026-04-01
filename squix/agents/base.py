@@ -5,9 +5,10 @@ from __future__ import annotations
 import asyncio
 import logging
 from abc import ABC, abstractmethod
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import Any, Callable, Awaitable
+from typing import Any
 
 from squix.models.base import ModelResponse
 
@@ -49,6 +50,9 @@ class BaseAgent(ABC):
     agent_id: str = "base"
     role: str = ""
 
+    # Type alias for progress callback: (agent_id, text, task_id) -> None
+    ProgressCb = Callable[[str, str, str], Awaitable[None]]
+
     def __init__(
         self,
         agent_id: str | None = None,
@@ -61,6 +65,11 @@ class BaseAgent(ABC):
         result_queue: asyncio.Queue | None = None,
         cost_tracker: Any = None,
         policy: Any = None,
+        workspace_manager: Any = None,
+        skills: Any = None,
+        task_state: Any = None,
+        primary_tracker: Any = None,
+        progress_cb: ProgressCb | None = None,
     ) -> None:
         self.agent_id = agent_id or self.agent_id
         self.role = role or self.role
@@ -75,9 +84,56 @@ class BaseAgent(ABC):
         self._result_queue = result_queue
         self._cost_tracker = cost_tracker
         self._policy = policy
+        self._workspace = workspace_manager
+        self._skills = skills
+        self._task_state = task_state
+        self._primary = primary_tracker
+        self._progress_cb = progress_cb
         # Conversation history for current task context
         self._conversation: list[dict[str, str]] = []
         self._current_task_id: str = ""
+
+    async def set_progress(self, text: str, **detail: Any) -> None:
+        """Set progress text and optionally emit to UI callback.
+
+        Call this instead of ``self.progress = text`` when you want
+        the user to see live progress during task execution.
+        """
+        self.progress = text
+        if self._progress_cb and self._current_task_id:
+            try:
+                await self._progress_cb(
+                    self.agent_id, text, self._current_task_id,
+                )
+            except Exception as e:
+                logger.debug("Progress callback error: %s", e)
+
+    async def invoke_skill(
+        self,
+        skill_name: str,
+        params: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Call a skill through the skill registry.
+
+        Think → Act → Observe loop: agents call this instead of
+        "telling the user to do something".
+        """
+        if not self._skills:
+            return {"status": "error", "error": "Skills not available"}
+
+        params = params or {}
+        try:
+            result = await self._skills.call(skill_name, params, agent_id=self.agent_id)
+            # Record in task state if available
+            if self._task_state:
+                self._task_state.record_skill(skill_name, params, result, self.agent_id)
+            return result
+        except PermissionError as e:
+            logger.warning("Agent %s denied skill %s: %s", self.agent_id, skill_name, e)
+            return {"status": "permission_denied", "error": str(e)}
+        except Exception as e:
+            logger.exception("Agent %s skill %s error", self.agent_id, skill_name)
+            return {"status": "error", "error": str(e)}
 
     async def put_message(self, msg: AgentMessage) -> None:
         """Place a message in this agent's inbox for processing."""

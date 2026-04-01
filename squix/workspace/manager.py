@@ -18,9 +18,9 @@ class WorkspaceManager:
         project_dir: Path,
         config: dict[str, Any] | None = None,
     ) -> None:
-        self.project_dir = project_dir
+        self.project_dir = project_dir.resolve()
         self.config = config or {}
-        self.artifacts_dir = project_dir / self.config.get("artifacts_dir", ".squix/artifacts")
+        self.artifacts_dir = self.project_dir / self.config.get("artifacts_dir", ".squix/artifacts")
 
     def init(self) -> None:
         """Create workspace directories."""
@@ -53,6 +53,11 @@ class WorkspaceManager:
             rel = f.relative_to(self.project_dir)
             depth = len(rel.parts)
             if depth <= max_depth:
+                # Skip common system files/dirs
+                name = f.name
+                if name in (".DS_Store", "Thumbs.db", ".git", "node_modules",
+                            "__pycache__", ".venv", "venv", ".squix", ".ruff_cache"):
+                    continue
                 result.append(str(rel))
         return sorted(result)
 

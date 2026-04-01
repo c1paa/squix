@@ -1,7 +1,11 @@
-"""Talk agent — the single entry point for all user messages.
+"""Talk agent — the ONLY external user interface.
 
-Classifies user input and either responds directly or delegates to
-the appropriate specialist agent (plan, idea, product, etc.).
+Talk:
+  1. Receives ALL user messages
+  2. Uses keyword pre-check for fast routing
+  3. Falls back to LLM classification
+  4. ALWAYS delegates to Orch (never directly to workers)
+  5. Orch handles dispatch, validation, and result formatting
 """
 
 from __future__ import annotations
@@ -13,65 +17,119 @@ from squix.agents.base import AgentMessage, BaseAgent
 
 logger = logging.getLogger("squix.agent.talk")
 
-# Classification prompt that explains all available agents
-_CLASSIFY_PROMPT = """\
-You are Talk — the router agent in the Squix AI system.
-Your job is to classify the user's message and decide how to handle it.
-
-Available agents and when to use them:
-- "talk" — answer yourself for: greetings, simple questions, casual chat, general knowledge
-- "plan" — delegate for: complex tasks that need multiple steps (coding, building, creating)
-- "idea" — delegate for: brainstorming, discussing project ideas, exploring concepts
-- "product" — delegate for: product planning, features, UX, roadmaps, turning ideas into products
-- "web" — delegate for: when user needs web search, external information, documentation lookup
-- "DB" — delegate for: project knowledge questions, retrieving stored information
-- "build" — delegate for: simple single-step coding tasks (write a function, fix one thing)
-- "debug" — delegate for: debugging, error analysis, finding bugs
-
-Rules:
-1. If the message is casual chat, greeting, or a simple question — handle it yourself ("talk")
-2. If it's a complex task requiring planning — send to "plan"
-3. If it's about ideas or brainstorming — send to "idea"
-4. If it's about product/feature planning — send to "product"
-5. If it's a simple coding task (one step) — send to "build"
-6. If it's about debugging/errors — send to "debug"
-
-Respond with ONLY a JSON object (no markdown, no explanation):
-{"action": "talk" or agent_id, "reason": "brief reason"}
-
-If action is "talk", also include a "response" field with your answer to the user.
-{"action": "talk", "reason": "greeting", "response": "your answer here"}
-"""
+# ── Keyword pre-check: catch obvious tasks regardless of conversational wrapper ──
+_DEBUG_KW = (
+    "not working", "не работает", "почини", "исправ",
+    "ошибк", "баг", "глюк", "bug", "error",
+    "debug", "broken", "краш", "проблем", "проблема",
+    "проблемы", "падет", "падает", "fix", "починить",
+    "исправить", "почему не", "what is wrong", "wrong with",
+    "why does", "why doesn", "why doesn't", "what's wrong", "что не так",
+    "почему не",
+)
+_BUILD_KW = (
+    "write", "создай", "напиши", "сделай", "добавь",
+    "удали", "измени", "build", "create", "implement",
+    "refactor", "optimize", "добавить", "удалить",
+    "изменить", "рефактор", "игра", "game", "игру",
+    "приложение", "app", "сайт", "site", "скрипт", "script",
+    "функцию", "function", "класс", "class", "модуль", "module",
+)
+_GREETING_KW = (
+    "привет", "hello", "hi ", "hey", "добрый", "доброе",
+    "здравствуйте", "как дела", "how are you",
+)
+_PLAN_KW = (
+    "спроектируй", "спланируй", "архитектур", "design",
+    "планирую", "запланируй", "спроектируй", "план проекта",
+    "как сделать", "how to make", "how would you",
+    "как лучше", "что лучше", "как бы ты",
+)
+_RESEARCH_KW = (
+    "найди", "найди в интернете", "погугли", "search for",
+    "look up", "документацию", "documentation",
+    "разработк", "research", "исследуй",
+)
+_DOCS_KW = (
+    "readme", "документацию", "documentation", "напиши readme",
+    "create readme", "обнови документацию", "update documentation",
+    "инструкцию", "manual", "manual for", "инструкция для",
+)
 
 
 class TalkAgent(BaseAgent):
-    """Single entry point for all user messages. Classifies and routes."""
+    """Sole user-facing interface. Classify → delegate to Orch."""
 
     agent_id = "talk"
     role = (
-        "Talk — the user-facing router. Classify messages and either "
-        "answer directly or delegate to the right specialist agent."
+        "TALK — you are the ONLY interface between the user and the Squix AI "
+        "company. Your job: receive messages from the user, classify them, "
+        "and either answer directly (greetings, simple questions) or delegate "
+        "to ORCH (the operations manager). "
+        "You NEVER delegate directly to build/debug/web/DB — always through ORCH. "
+        "You NEVER produce code or make file changes. "
+        "When you receive a result from Orch, return a concise "
+        "summary to the user."
     )
 
     def _default_system_prompt(self) -> str:
-        return _CLASSIFY_PROMPT
+        return (
+            "You are Talk, the router agent in the Squix AI system.\n"
+            "Classify messages and either respond directly or delegate to ORCH.\n\n"
+            "Agents (for reference only — always delegate to orch, never to them):\n"
+            "  plan (big tasks), debug (bugs/errors), build (code creation),\n"
+            "  web (external info), DB (project knowledge), AI (ML tasks),\n"
+            "  idea (brainstorming), product (features/UX),\n"
+            "  orch (task coordination), README (docs).\n\n"
+            "When delegating, send to ORCH with:\n"
+            '  {"action": "orch", "task_type": "...", "reason": "...", '
+            '"output_mode": "..." }\n\n'
+            "task_type options: simple_chat, code_edit, code_generate, "
+            "debugging, research, docs_write, product_discussion\n"
+            "output_mode options: text_response, file_patch, file_create, "
+            "multi_file_project_output, summary_with_artifacts"
+        )
 
     async def handle(self, msg: AgentMessage) -> AgentMessage | None:
         self.progress = "Classifying user input..."
 
+        # ─── 1. Keyword pre-check ───
+        kw_result = self._classify_by_keywords(msg.content)
+        if kw_result:
+            task_type, output_mode, reason = kw_result
+            if task_type == "simple_chat":
+                direct = await self._generate_chat_response(msg.content)
+                self.progress = "Responded directly (keyword match)"
+                return AgentMessage(
+                    sender=self.agent_id, recipient="user",
+                    content=direct, task_id=msg.task_id,
+                    metadata={"type": "chat", "reason": reason},
+                )
+            # Delegate to ORCH (never directly to workers)
+            self.progress = f"Delegating to orch (keyword match: {task_type})"
+            return AgentMessage(
+                sender=self.agent_id,
+                recipient="orch",
+                content=msg.content,
+                task_id=msg.task_id,
+                metadata={
+                    "type": "delegate",
+                    "reason": reason,
+                    "task_type": task_type,
+                    "output_mode": output_mode,
+                },
+            )
+
+        # ─── 2. LLM classification ───
         messages = [
             {"role": "system", "content": self.system_prompt},
             {"role": "user", "content": msg.content},
         ]
         response = await self.invoke_llm(messages, temperature=0.3)
-
-        # Parse the classification
-        action, reason, direct_response = self._parse_classification(response.text)
+        action, task_type, output_mode, reason, direct_response = self._parse_classification(response.text)
 
         if action == "talk":
-            # Respond directly to the user
             if not direct_response:
-                # LLM didn't include a response, generate one
                 direct_response = await self._generate_chat_response(msg.content)
             self.progress = "Responded directly"
             return AgentMessage(
@@ -79,25 +137,60 @@ class TalkAgent(BaseAgent):
                 recipient="user",
                 content=direct_response,
                 task_id=msg.task_id,
-                metadata={"type": "chat", "reason": reason},
+                metadata={"type": "chat", "task_type": task_type, "reason": reason},
             )
         else:
-            # Delegate to another agent
-            self.progress = f"Delegating to {action}"
+            # ALWAYS delegate to orch (never to workers directly)
+            self.progress = f"Delegating to orch (LLM: {task_type})"
             return AgentMessage(
                 sender=self.agent_id,
-                recipient=action,
+                recipient="orch",
                 content=msg.content,
                 task_id=msg.task_id,
-                metadata={"type": "delegate", "reason": reason, "original_sender": "user"},
+                metadata={
+                    "type": "delegate",
+                    "task_type": task_type,
+                    "output_mode": output_mode,
+                    "reason": reason,
+                },
             )
 
-    def _parse_classification(self, text: str) -> tuple[str, str, str]:
-        """Parse the LLM classification response. Returns (action, reason, response)."""
-        text = text.strip()
+    # ── Keyword pre-check ──────────────────────────────────────────────
 
-        # Try to extract JSON from the response
-        # Sometimes LLM wraps in markdown code blocks
+    def _classify_by_keywords(self, text: str) -> tuple[str, str, str] | None:
+        """Fast pre-check.
+
+        Returns (task_type, output_mode, reason) or None.
+        """
+        lower = text.lower()
+
+        # Debug takes priority
+        if any(kw in lower for kw in _DEBUG_KW):
+            return "debugging", "file_patch", "debug_keyword"
+        # Docs before build (README.md requests)
+        if any(kw in lower for kw in _DOCS_KW):
+            return "docs_write", "file_create", "docs_keyword"
+        # Build / generation
+        if any(kw in lower for kw in _BUILD_KW):
+            return "code_generate", "file_create", "build_keyword"
+        # Research
+        if any(kw in lower for kw in _RESEARCH_KW):
+            return "research", "summary_with_artifacts", "research_keyword"
+        # Plan / design
+        if any(kw in lower for kw in _PLAN_KW):
+            return "product_discussion", "text_response", "plan_keyword"
+        # Greeting
+        if any(kw in lower for kw in _GREETING_KW):
+            return "simple_chat", "text_response", "greeting"
+        return None
+
+    # ── LLM classification parser ──────────────────────────────────────
+
+    def _parse_classification(
+        self, text: str,
+    ) -> tuple[str, str, str, str, str]:
+        """Parse LLM JSON → (action, task_type, output_mode, reason, response)."""
+        text = text.strip()
         if "```" in text:
             parts = text.split("```")
             for part in parts:
@@ -108,24 +201,34 @@ class TalkAgent(BaseAgent):
                     text = part
                     break
 
+        defaults = ("talk", "simple_chat", "text_response", "parse_fallback", "")
+
         try:
             data = json.loads(text)
             action = data.get("action", "talk")
-            reason = data.get("reason", "")
+            task_type = data.get("task_type", "simple_chat")
+            output_mode = data.get("output_mode", "text_response")
+            reason = data.get("reason", "llm_default")
             response = data.get("response", "")
-            # Validate the action is a known agent
-            valid_targets = {"talk", "plan", "idea", "product", "web", "DB",
-                             "build", "debug", "orch", "AI", "README"}
-            if action not in valid_targets:
-                action = "talk"
-            return action, reason, response
         except (json.JSONDecodeError, TypeError, AttributeError):
-            # If parsing fails, treat the whole text as a direct response
-            logger.warning("Talk: failed to parse classification, treating as direct response")
-            return "talk", "parse_fallback", text
+            return defaults
+
+        # Sanitize
+        valid_actions = {
+            "talk", "plan", "idea", "product", "web", "DB",
+            "build", "debug", "orch", "AI", "README",
+        }
+        if action not in valid_actions:
+            action = "talk"
+        # Force everything to go through orch
+        if action != "talk":
+            action = "orch"
+
+        return action, task_type, output_mode, reason, response
+
+    # ── Direct chat generator ──────────────────────────────────────────
 
     async def _generate_chat_response(self, user_input: str) -> str:
-        """Generate a direct chat response when talk handles it itself."""
         messages = [
             {"role": "system", "content": (
                 "You are Squix — a helpful AI assistant. "
