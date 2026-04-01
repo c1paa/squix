@@ -30,6 +30,7 @@ class BuilderAgent(BaseAgent):
     async def handle(self, msg: AgentMessage) -> AgentMessage | None:
         await self.set_progress(f"Building: {msg.content[:80]}")
         task = msg.content
+        session_ctx = msg.metadata.get("session_context", "")
 
         # Snapshot of files that already exist BEFORE we do anything
         preexisting_files: set[str] = set()
@@ -66,11 +67,20 @@ class BuilderAgent(BaseAgent):
                 pass
 
         # ─── THINK + ACT: generate code directly ───
+        ctx_block = ""
+        if session_ctx:
+            ctx_block = (
+                f"\n--- SESSION CONTEXT ---\n{session_ctx}\n"
+                "--- END SESSION CONTEXT ---\n"
+                "Use this to understand what the user has been working on.\n\n"
+            )
+
         if existing:
             system = (
                 f"You are BUILDER: a code executor. "
                 f"Your job: modify '{target_path}'.\n"
                 f"Task: {task[:200]}\n\n"
+                f"{ctx_block}"
                 f"CURRENT FILE:\n```{existing[:8000]}\n```\n\n"
                 "INSTRUCTIONS:\n"
                 "1. Produce the COMPLETE, FINAL version.\n"
@@ -83,6 +93,7 @@ class BuilderAgent(BaseAgent):
                 f"You are BUILDER: a code executor. "
                 f"Your job: create file '{target_path}'.\n"
                 f"Task: {task[:200]}\n\n"
+                f"{ctx_block}"
                 "INSTRUCTIONS:\n"
                 "1. Produce a COMPLETE, WORKING implementation.\n"
                 "2. Wrap in a code fence with the language tag.\n"
@@ -162,7 +173,7 @@ class BuilderAgent(BaseAgent):
                 "type": "work",
                 "status": "success",
                 "files_created": files_created,
-                "files_modified": files_modified if files_modified else [target_path],
+                "files_modified": files_modified,
             },
         )
 

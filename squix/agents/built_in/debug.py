@@ -30,8 +30,9 @@ class DebuggerAgent(BaseAgent):
     )
 
     async def handle(self, msg: AgentMessage) -> AgentMessage | None:
-        self.progress = f"Debugging: {msg.content[:60]}"
+        await self.set_progress(f"Debugging: {msg.content[:60]}")
         task = msg.content
+        self._session_ctx = msg.metadata.get("session_context", "")
 
         # ─── THINK: classify problem ───
         think_result = await self._think(task)
@@ -184,10 +185,15 @@ class DebuggerAgent(BaseAgent):
     # ─── THINK: analyze ────────────────────────────────────────────────
 
     async def _analyze(self, task: str, path: str, content: str) -> dict:
+        ctx = getattr(self, "_session_ctx", "")
+        ctx_block = ""
+        if ctx:
+            ctx_block = f"\n\nSession context:\n{ctx}\n"
         messages = [
             {"role": "system", "content": (
                 "You are a senior debugger. Given the real file content and a problem "
                 "description, identify the root cause and produce the fixed version.\n\n"
+                f"{ctx_block}"
                 "Respond with JSON ONLY:\n"
                 '{"diagnosis": "clear explanation of the bug and root cause", '
                 '"fix_code": "the COMPLETE fixed file content, ready to be written"}\n\n'

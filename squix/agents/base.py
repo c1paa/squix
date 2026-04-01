@@ -108,6 +108,14 @@ class BaseAgent(ABC):
             except Exception as e:
                 logger.debug("Progress callback error: %s", e)
 
+    def set_progress_callback(self, cb: Any) -> None:
+        """Set the progress callback from the engine.
+
+        Engine calls this during startup to wire live progress updates.
+        Callback signature: (agent_id, text, task_id) -> None (can be async).
+        """
+        self._progress_cb = cb
+
     async def invoke_skill(
         self,
         skill_name: str,
@@ -127,6 +135,29 @@ class BaseAgent(ABC):
             # Record in task state if available
             if self._task_state:
                 self._task_state.record_skill(skill_name, params, result, self.agent_id)
+            # Emit skill event to result queue for real-time UI
+            if self._result_queue:
+                skill_meta: dict[str, Any] = {
+                    "type": "skill",
+                    "skill": skill_name,
+                    "agent_id": self.agent_id,
+                }
+                # Include file path for file operations
+                if "path" in params:
+                    skill_meta["path"] = params["path"]
+                if isinstance(result, dict):
+                    skill_meta["result_status"] = result.get("status", "ok")
+                    if "content" in result and skill_name == "read_file":
+                        skill_meta["lines"] = len(
+                            result["content"].splitlines()
+                        ) if isinstance(result.get("content"), str) else 0
+                await self._result_queue.put(AgentMessage(
+                    sender=self.agent_id,
+                    recipient="user",
+                    content=f"skill:{skill_name}",
+                    task_id=self._current_task_id,
+                    metadata=skill_meta,
+                ))
             return result
         except PermissionError as e:
             logger.warning("Agent %s denied skill %s: %s", self.agent_id, skill_name, e)

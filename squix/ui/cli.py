@@ -418,6 +418,21 @@ class SquixCLI:
         self.print_banner()
         self._show_hints()
 
+        # Paid model warning (one-time at startup)
+        blocked_names: list[str] = []
+        if hasattr(self.engine, "registry"):
+            blocked_names = getattr(self.engine.registry, "blocked_paid_models", [])
+        if blocked_names:
+            names_str = ", ".join(blocked_names)
+            console.print()
+            console.print(
+                f"  [yellow]⛔ Paid models blocked: {names_str}[/yellow]",
+            )
+            console.print(
+                "  [yellow]To allow paid models, add `paid_model_ok: true` in your `squix.yml`[/yellow]",
+            )
+            console.print()
+
         kb = KeyBindings()
 
         @kb.add(Keys.BackTab)
@@ -470,123 +485,283 @@ class SquixCLI:
     # ------------------------------------------------------------------ #
 
     async def _handle_input(self, text: str) -> None:
-        """Process user input through the agent system, respecting current mode."""
+        """Process user input through the agent system with real-time execution display."""
         th = self._th()
+        mode = self.current_mode
 
         # Show what user typed
-        console.print(f"[dim]You:[/dim] {text}")
+        console.print(f"  [dim]You:[/dim] {text}")
         console.print()
 
         try:
-            mode = self.current_mode
-
+            # ── Talk mode: simple chat, no pipeline ──
             if mode == "talk":
-                # Talk mode: direct LLM chat, no classification, no delegation
-                with console.status("[bold green]Chatting...", spinner="dots"):
+                with console.status("[bold cyan]Thinking...", spinner="dots"):
                     results = await self.engine.chat_only(text)
+                if results:
+                    content = results[0].content
+                    console.print(f"  {content}")
+                    console.print()
+                    self.engine.update_session_context(
+                        response=content, agent_chain=["talk"],
+                    )
+                else:
+                    console.print("  [dim]No response.[/dim]")
+                    console.print()
+                return
 
-            elif mode == "plan":
-                # Plan mode: show what WOULD happen but don't execute
+            # ── Plan mode: show what would happen ──
+            if mode == "plan":
                 with console.status("[bold yellow]Planning...", spinner="dots"):
                     results = await self.engine.plan_only(text)
-
-            elif mode == "interactive":
-                # Interactive mode: run pipeline, display intermediate steps
-                # The engine returns all messages including delegation info
-                with console.status("[bold green]Thinking...", spinner="dots"):
-                    results = await self.engine.process_input(text)
-
-            else:
-                # Auto mode (default): full pipeline, no questions asked
-                with console.status("[bold green]Thinking...", spinner="dots"):
-                    results = await self.engine.process_input(text)
-
-            if not results:
-                console.print("[dim]No response.[/dim]")
+                for r in results:
+                    rtype = r.metadata.get("type", "")
+                    if rtype == "error":
+                        console.print(f"  [bold red]Error:[/bold red] {r.content}")
+                    else:
+                        console.print(Panel(
+                            r.content,
+                            title="[bold yellow]Plan[/bold yellow]",
+                            border_style="yellow",
+                        ))
+                if results:
+                    self.engine.update_session_context(
+                        response=results[-1].content, agent_chain=["talk", "plan"],
+                    )
                 console.print()
                 return
 
-            # Display results in Claude Code-like pipeline format
-            pipeline_steps = []
-            final_content = ""
+            # ── Auto / Interactive: streaming execution ──
+            task_id = await self.engine.submit_input(text)
 
-            for msg in results:
-                msg_type = msg.metadata.get("type", "")
-                sender = msg.sender
+            # Task header
+            mi = self._mode_info()
+            project_name = self.engine.project_dir.name
+            console.print(f"  [dim]{'─' * 60}[/dim]")
+            console.print(
+                f"  [{mi['color']}]{mi['icon']} {mi['label']}[/{mi['color']}]"
+                f"  [dim]|[/dim]  {task_id}"
+                f"  [dim]|[/dim]  {project_name}"
+            )
+            console.print(f"  [dim]{'─' * 60}[/dim]")
+            console.print()
 
-                if msg_type == "error":
-                    # Show error inline immediately
-                    console.print(f"  [bold red]ERROR ({sender}):[/bold red] {msg.content}")
-                    pipeline_steps.append(("error", msg.content))
+            # Stream execution events and collect context
+            result_info = await self._stream_execution(task_id)
 
-                elif msg_type == "chat":
-                    # Direct chat response — show as user-facing result
-                    final_content = msg.content
+            # Update session context so subsequent tasks have history
+            self.engine.update_session_context(
+                response=result_info.get("content", ""),
+                files=result_info.get("files", []),
+                agent_chain=result_info.get("agent_chain", []),
+            )
 
-                elif msg_type == "routing":
-                    # Pipeline step: agent A → agent B
-                    target = msg.metadata.get("to", sender)
-                    preview = msg.content[:80]
-                    pipeline_steps.append(
-                        ("handoff", f"{sender} → {target}: {preview}")
-                    )
-                    # Show each step as it happens
-                    step_icon = "[bold yellow]→[/bold yellow]"
-                    console.print(f"  {step_icon} [dim]{sender}[/dim] → [bold]{target}[/bold]")
-                    console.print(f"    [dim]{msg.content[:120]}[/dim]")
-
-                elif msg_type == "delegate":
-                    # Task delegation notification — show as pipeline start
-                    worker = msg.recipient
-                    pipeline_steps.append(
-                        ("dispatch", f"Dispatching to {worker}")
-                    )
-                    console.print(
-                        f"  [bold blue]⚙ Dispatching:[/bold blue] [dim]→ {worker}[/dim]"
-                    )
-
-                elif msg_type == "final_result":
-                    # Final result — this is the answer
-                    final_content = msg.content
-
-                elif msg_type == "result":
-                    # Intermediate result from worker
-                    final_content = msg.content
-                    pipeline_steps.append(("result", msg.content[:200]))
-
-                else:
-                    # Catch-all: add to pipeline if not empty
-                    if msg.content and msg.content.strip():
-                        pipeline_steps.append(("other", msg.content[:200]))
-                        # Use as fallback final content if nothing else set
-                        if not final_content:
-                            final_content = msg.content[:500]
-
-            # If we have pipeline steps but no explicit final content,
-            # use the last step's content as the result
-            if not final_content and pipeline_steps:
-                last_step = pipeline_steps[-1]
-                final_content = last_step[1]
-
-            # Show final pipeline result box
-            if final_content:
-                console.print()
-                self.print_msg("Result", final_content,
-                               color=th["agent_color"], border=th["agent_border"])
-
-            elif not pipeline_steps:
-                console.print("[dim]No response.[/dim]")
-
-            # Show cost if any
-            if self.engine.cost_tracker.total_cost > 0:
-                total = self.engine.cost_tracker.total_cost
-                calls = self.engine.cost_tracker.total_calls
-                console.print(f"  [dim]$ {total:.4f}  |  {calls} calls[/dim]")
-                console.print()
+            # Complete task in session
+            await self.engine.complete_task(task_id)
 
         except Exception as e:
             self.print_msg("Error", str(e),
                            color=th["error_color"], border=th["error_border"])
+
+    # ------------------------------------------------------------------ #
+    #  Streaming execution display
+    # ------------------------------------------------------------------ #
+
+    async def _stream_execution(self, task_id: str) -> dict[str, Any]:
+        """Stream and display execution events in real-time from the result queue.
+
+        Returns a dict with result info for session context update:
+        ``{"content": ..., "files": [...], "agent_chain": [...]}``
+        """
+        th = self._th()
+        overall_timeout = 120
+        step_timeout = 30
+        started = asyncio.get_event_loop().time()
+        has_routing = False
+        files_created: list[str] = []
+        files_modified: list[str] = []
+        seen_skills: set[str] = set()  # dedup repeated progress
+        agent_chain: list[str] = []
+        final_content: str = ""
+
+        while True:
+            elapsed = asyncio.get_event_loop().time() - started
+            remaining = max(0, overall_timeout - elapsed)
+            if remaining <= 0:
+                console.print("  [red]Timeout — task took too long.[/red]")
+                break
+
+            try:
+                msg = await asyncio.wait_for(
+                    self.engine._result_queue.get(),
+                    timeout=min(step_timeout, remaining),
+                )
+                # Skip messages from other tasks
+                if msg.task_id and msg.task_id != task_id:
+                    continue
+
+                msg_type = msg.metadata.get("type", "")
+
+                # ── Routing: agent → agent ──
+                if msg_type == "routing":
+                    src = msg.metadata.get("from", "?")
+                    dst = msg.metadata.get("to", "?")
+                    # Track agent chain for context
+                    if src not in agent_chain:
+                        agent_chain.append(src)
+                    if dst not in agent_chain:
+                        agent_chain.append(dst)
+                    preview = msg.content
+                    # Strip the "→ agent: " prefix from content
+                    if preview.startswith("→"):
+                        preview = preview.split(":", 1)[-1].strip()
+                    if len(preview) > 80:
+                        preview = preview[:77] + "..."
+                    console.print(
+                        f"  [cyan]▸[/cyan] [bold]{src}[/bold] → [bold]{dst}[/bold]"
+                        f"  [dim]{preview}[/dim]"
+                    )
+                    has_routing = True
+                    step_timeout = 120
+                    continue
+
+                # ── Delegation: talk classified and forwarded ──
+                if msg_type == "delegate":
+                    target = msg.recipient if msg.recipient != "user" else msg.metadata.get("to", "?")
+                    if "talk" not in agent_chain:
+                        agent_chain.append("talk")
+                    if target not in agent_chain:
+                        agent_chain.append(target)
+                    console.print(
+                        f"  [cyan]▸[/cyan] [bold]talk[/bold] → [bold]{target}[/bold]"
+                        f"  [dim]Delegating task[/dim]"
+                    )
+                    has_routing = True
+                    step_timeout = 120
+                    continue
+
+                # ── Progress: agent working ──
+                if msg_type == "progress":
+                    agent_id = msg.metadata.get("agent_id", msg.sender)
+                    text = msg.content
+                    # Skip duplicate/noisy progress
+                    key = f"{agent_id}:{text}"
+                    if key in seen_skills:
+                        continue
+                    seen_skills.add(key)
+                    console.print(
+                        f"  [green]●[/green] [bold]{agent_id}[/bold]"
+                        f"  [dim]{text}[/dim]"
+                    )
+                    continue
+
+                # ── Skill: file operation or tool use ──
+                if msg_type == "skill":
+                    skill = msg.metadata.get("skill", "?")
+                    agent_id = msg.metadata.get("agent_id", msg.sender)
+                    path = msg.metadata.get("path", "")
+
+                    if skill == "read_file":
+                        lines = msg.metadata.get("lines", 0)
+                        detail = f" ({lines} lines)" if lines else ""
+                        console.print(
+                            f"  [blue]◇[/blue] [bold]{agent_id}[/bold]"
+                            f"  read  [dim]{path}{detail}[/dim]"
+                        )
+                    elif skill == "write_file":
+                        console.print(
+                            f"  [green]◆[/green] [bold]{agent_id}[/bold]"
+                            f"  write [green]{path}[/green]"
+                        )
+                        if path and path not in files_created:
+                            files_created.append(path)
+                    elif skill == "patch_file":
+                        console.print(
+                            f"  [yellow]◆[/yellow] [bold]{agent_id}[/bold]"
+                            f"  patch [yellow]{path}[/yellow]"
+                        )
+                        if path and path not in files_modified:
+                            files_modified.append(path)
+                    elif skill == "run_command":
+                        cmd = msg.metadata.get("path", "")  # command in path field
+                        console.print(
+                            f"  [magenta]$[/magenta] [bold]{agent_id}[/bold]"
+                            f"  exec  [dim]{cmd}[/dim]"
+                        )
+                    else:
+                        console.print(
+                            f"  [blue]◇[/blue] [bold]{agent_id}[/bold]"
+                            f"  {skill}  [dim]{path}[/dim]"
+                        )
+                    continue
+
+                # ── Error ──
+                if msg_type == "error":
+                    final_content = msg.content
+                    console.print()
+                    console.print(f"  [bold red]Error:[/bold red] {msg.content}")
+                    console.print()
+                    break
+
+                # ── Final result ──
+                if msg_type in ("chat", "final_result", "result"):
+                    # Collect file lists from metadata
+                    if msg_type == "final_result":
+                        fc = msg.metadata.get("files_created", []) or []
+                        fm = msg.metadata.get("files_modified", []) or []
+                        for f in fc:
+                            if f not in files_created:
+                                files_created.append(f)
+                        for f in fm:
+                            if f not in files_modified:
+                                files_modified.append(f)
+
+                    final_content = msg.content.strip()
+
+                    console.print()
+                    console.print(f"  [dim]{'─' * 60}[/dim]")
+                    console.print()
+
+                    # Result content
+                    if final_content:
+                        self.print_msg(
+                            "Result", final_content,
+                            color=th["agent_color"], border=th["agent_border"],
+                        )
+
+                    # File summary
+                    if files_created or files_modified:
+                        if files_created:
+                            for f in files_created:
+                                console.print(f"  [green]+ {f}[/green]")
+                        if files_modified:
+                            for f in files_modified:
+                                console.print(f"  [yellow]~ {f}[/yellow]")
+                        console.print()
+
+                    # Cost
+                    if self.engine.cost_tracker.total_cost > 0:
+                        total = self.engine.cost_tracker.total_cost
+                        calls = self.engine.cost_tracker.total_calls
+                        console.print(f"  [dim]${total:.4f}  |  {calls} calls[/dim]")
+                        console.print()
+                    break
+
+            except TimeoutError:
+                if has_routing:
+                    console.print()
+                    console.print("  [dim]Task dispatched — waiting for workers...[/dim]")
+                    console.print()
+                else:
+                    console.print("  [dim]No response received.[/dim]")
+                    console.print()
+                break
+
+        return {
+            "content": final_content,
+            "files": files_created + files_modified,
+            "agent_chain": agent_chain,
+        }
 
     # ------------------------------------------------------------------ #
     #  Commands

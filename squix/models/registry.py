@@ -13,18 +13,38 @@ logger = logging.getLogger("squix.models.registry")
 class ModelRegistry:
     """Keeps track of all registered models and creates adapters on demand."""
 
-    def __init__(self, model_configs: list[dict[str, Any]], **secrets: Any) -> None:
+    def __init__(
+        self,
+        model_configs: list[dict[str, Any]],
+        paid_model_ok: bool = False,
+        **secrets: Any,
+    ) -> None:
         """
         Args:
             model_configs: list of model entries from config
+            paid_model_ok: whether to include paid models (user-approved)
             secrets: provider credentials (e.g. openrouter_api_key=...)
         """
         self._configs: dict[str, dict[str, Any]] = {}
         self._adapters: dict[str, ModelAdapter] = {}
         self._secrets = secrets
+        self._paid_model_ok = paid_model_ok
+        self._blocked_paid_models: list[str] = []
 
         for m in model_configs:
+            if m.get("paid", False) and not paid_model_ok:
+                self._blocked_paid_models.append(m["id"])
+                logger.info(
+                    "⛔ Blocked paid model '%s' (set paid_model_ok: true to allow)",
+                    m["id"],
+                )
+                continue
             self._configs[m["id"]] = m
+
+    @property
+    def blocked_paid_models(self) -> list[str]:
+        """Return list of paid model IDs that were blocked."""
+        return list(self._blocked_paid_models)
 
     def get_model_ids(self) -> list[str]:
         return list(self._configs.keys())

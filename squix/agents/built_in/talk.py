@@ -91,22 +91,27 @@ class TalkAgent(BaseAgent):
         )
 
     async def handle(self, msg: AgentMessage) -> AgentMessage | None:
-        self.progress = "Classifying user input..."
+        await self.set_progress("Classifying user input...")
+
+        # Extract session context from metadata (injected by engine)
+        session_ctx = msg.metadata.get("session_context", "")
 
         # ─── 1. Keyword pre-check ───
         kw_result = self._classify_by_keywords(msg.content)
         if kw_result:
             task_type, output_mode, reason = kw_result
             if task_type == "simple_chat":
-                direct = await self._generate_chat_response(msg.content)
-                self.progress = "Responded directly (keyword match)"
+                direct = await self._generate_chat_response(
+                    msg.content, session_ctx,
+                )
+                await self.set_progress("Responded directly (keyword match)")
                 return AgentMessage(
                     sender=self.agent_id, recipient="user",
                     content=direct, task_id=msg.task_id,
                     metadata={"type": "chat", "reason": reason},
                 )
-            # Delegate to ORCH (never directly to workers)
-            self.progress = f"Delegating to orch (keyword match: {task_type})"
+            # Delegate to ORCH with session context
+            await self.set_progress(f"Delegating to orch (keyword match: {task_type})")
             return AgentMessage(
                 sender=self.agent_id,
                 recipient="orch",
@@ -117,12 +122,23 @@ class TalkAgent(BaseAgent):
                     "reason": reason,
                     "task_type": task_type,
                     "output_mode": output_mode,
+                    "session_context": session_ctx,
                 },
             )
 
-        # ─── 2. LLM classification ───
+        # ─── 2. LLM classification (with session context) ───
+        system = self.system_prompt
+        if session_ctx:
+            system += (
+                "\n\n--- SESSION CONTEXT (what happened before) ---\n"
+                f"{session_ctx}\n"
+                "--- END SESSION CONTEXT ---\n\n"
+                "Use this context to understand what the user is referring to. "
+                "If the user asks about their project or recent work, you can "
+                "answer directly based on this context (action=talk)."
+            )
         messages = [
-            {"role": "system", "content": self.system_prompt},
+            {"role": "system", "content": system},
             {"role": "user", "content": msg.content},
         ]
         response = await self.invoke_llm(messages, temperature=0.3)
@@ -130,8 +146,10 @@ class TalkAgent(BaseAgent):
 
         if action == "talk":
             if not direct_response:
-                direct_response = await self._generate_chat_response(msg.content)
-            self.progress = "Responded directly"
+                direct_response = await self._generate_chat_response(
+                    msg.content, session_ctx,
+                )
+            await self.set_progress("Responded directly")
             return AgentMessage(
                 sender=self.agent_id,
                 recipient="user",
@@ -141,7 +159,7 @@ class TalkAgent(BaseAgent):
             )
         else:
             # ALWAYS delegate to orch (never to workers directly)
-            self.progress = f"Delegating to orch (LLM: {task_type})"
+            await self.set_progress(f"Delegating to orch (LLM: {task_type})")
             return AgentMessage(
                 sender=self.agent_id,
                 recipient="orch",
@@ -152,6 +170,7 @@ class TalkAgent(BaseAgent):
                     "task_type": task_type,
                     "output_mode": output_mode,
                     "reason": reason,
+                    "session_context": session_ctx,
                 },
             )
 
@@ -228,13 +247,18 @@ class TalkAgent(BaseAgent):
 
     # ── Direct chat generator ──────────────────────────────────────────
 
-    async def _generate_chat_response(self, user_input: str) -> str:
+    async def _generate_chat_response(
+        self, user_input: str, session_ctx: str = "",
+    ) -> str:
+        system = (
+            "You are Squix — a helpful AI assistant. "
+            "Answer concisely and naturally. "
+            "If you don't know something, say so briefly."
+        )
+        if session_ctx:
+            system += f"\n\nSession context:\n{session_ctx}"
         messages = [
-            {"role": "system", "content": (
-                "You are Squix — a helpful AI assistant. "
-                "Answer concisely and naturally. "
-                "If you don't know something, say so briefly."
-            )},
+            {"role": "system", "content": system},
             {"role": "user", "content": user_input},
         ]
         response = await self.invoke_llm(messages, temperature=0.7)

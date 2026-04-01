@@ -59,7 +59,7 @@ class OrchestratorAgent(BaseAgent):
     ) -> AgentMessage | None:
         """Primary flow: Talk → Orch → worker → validate → user."""
         task = msg.content
-        self.progress = f"Deciding worker for: {task[:60]}"
+        await self.set_progress(f"Deciding worker for: {task[:60]}")
 
         # Step 1: Decide which worker to use
         worker = await self._decide_worker(task, task_type)
@@ -67,9 +67,10 @@ class OrchestratorAgent(BaseAgent):
         if not self._send_fn:
             return self._format_failure(task, msg.task_id, "No send function")
 
-        self.progress = f"Dispatching to {worker}"
+        await self.set_progress(f"Dispatching to {worker}")
 
-        # Step 2: Dispatch
+        # Step 2: Dispatch with session context
+        session_ctx = msg.metadata.get("session_context", "")
         step_msg = AgentMessage(
             sender=self.agent_id,
             recipient=worker,
@@ -79,6 +80,7 @@ class OrchestratorAgent(BaseAgent):
                 "type": "step",
                 "orch_direct": True,
                 "task_type": task_type,
+                "session_context": session_ctx,
             },
         )
         await self._send_fn(step_msg)
@@ -169,7 +171,7 @@ class OrchestratorAgent(BaseAgent):
 
     async def _handle_plan(self, msg: AgentMessage) -> AgentMessage | None:
         """Execute a plan from the Planner agent."""
-        self.progress = "Parsing plan..."
+        await self.set_progress("Parsing plan...")
         steps = self._extract_steps(msg.content)
 
         if not steps:
@@ -187,7 +189,7 @@ class OrchestratorAgent(BaseAgent):
             if not self._send_fn:
                 continue
 
-            self.progress = f"Step {i+1}/{len(steps)}: → {target}"
+            await self.set_progress(f"Step {i+1}/{len(steps)}: → {target}")
 
             await self._send_fn(AgentMessage(
                 sender=self.agent_id, recipient=target,

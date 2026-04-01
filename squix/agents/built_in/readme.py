@@ -15,13 +15,13 @@ class ReadmeAgent(BaseAgent):
     )
 
     async def handle(self, msg: AgentMessage) -> AgentMessage | None:
-        self.progress = f"Writing docs: {msg.content[:50]}"
+        await self.set_progress(f"Writing docs: {msg.content[:50]}")
         messages = [
             {"role": "system", "content": self.system_prompt},
             {"role": "user", "content": msg.content},
         ]
         response = await self.invoke_llm(messages)
-        self.progress = "Docs complete"
+        await self.set_progress("Docs complete")
         return AgentMessage(
             sender=self.agent_id,
             recipient="orch",

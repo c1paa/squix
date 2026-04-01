@@ -1,86 +1,95 @@
 # Squix — Default Configuration
-# All models disabled by default except Qwen 3.6 via OpenRouter.
-# Add more models later by editing your per-project squix.yml.
+# Default model uses OpenRouter's free tier ($0 cost).
+# Paid models are blocked by default. Set paid_model_ok: true in squix.yml to allow them.
 
 models:
-  - id: qwen/qwen3-235b-a22b
+  # ── Default free model: OpenRouter auto-rotates available free models ──
+  - id: openrouter/free
     provider: openrouter
-    name: "Qwen3 235B"
-    cost_per_1k_input: 0.0003
-    cost_per_1k_output: 0.001
-    context_limit: 131072
+    name: "OpenRouter Free Tier (auto-select)"
+    cost_per_1k_input: 0.0
+    cost_per_1k_output: 0.0
+    context_limit: 8192
     specialization: ["code", "reasoning", "general"]
-    daily_limit: null
-    monthly_limit: null
+    paid: false
     priority: 1
+
+  # ── Paid models (blocked unless user approves) ──
+  # Add your own paid model in squix.yml and set paid_model_ok: true:
+  # models:
+  #   - id: anthropic/claude-sonnet-4-20250514
+  #     provider: openrouter
+  #     cost_per_1k_input: 0.003
+  #     cost_per_1k_output: 0.015
+  #     paid: true
 
 agents:
   - id: talk
     name: "Talk"
     role: "User-facing router — classify messages and delegate or respond directly."
-    model_prefers: ["qwen/qwen3-235b-a22b"]
+    model_prefers: ["openrouter/free"]
     enabled: true
 
   - id: plan
     name: "Planner"
     role: "Break large tasks into actionable steps and control the orchestrator."
-    model_prefers: ["qwen/qwen3-235b-a22b"]
+    model_prefers: ["openrouter/free"]
     enabled: true
 
   - id: orch
     name: "Orchestrator"
     role: "Main task dispatcher — receives steps from planner and routes them to worker agents."
-    model_prefers: ["qwen/qwen3-235b-a22b"]
+    model_prefers: ["openrouter/free"]
     enabled: true
 
   - id: build
     name: "Builder"
     role: "Write code, implement solutions, create artifacts."
-    model_prefers: ["qwen/qwen3-235b-a22b"]
+    model_prefers: ["openrouter/free"]
     enabled: true
     count: 1
 
   - id: debug
     name: "Debugger"
     role: "Find bugs, fix errors, improve code quality."
-    model_prefers: ["qwen/qwen3-235b-a22b"]
+    model_prefers: ["openrouter/free"]
     enabled: true
     count: 1
 
   - id: web
     name: "Web Researcher"
     role: "Search the internet for information, documentation, and references."
-    model_prefers: ["qwen/qwen3-235b-a22b"]
+    model_prefers: ["openrouter/free"]
     enabled: true
 
   - id: DB
     name: "Knowledge Base"
     role: "Manage project knowledge, documentation database, and structured information."
-    model_prefers: ["qwen/qwen3-235b-a22b"]
+    model_prefers: ["openrouter/free"]
     enabled: true
 
   - id: AI
     name: "AI Specialist"
     role: "Handle ML, AI, model-related tasks and advice."
-    model_prefers: ["qwen/qwen3-235b-a22b"]
+    model_prefers: ["openrouter/free"]
     enabled: true
 
   - id: idea
     name: "Idea Explorer"
     role: "Discuss project ideas, propose alternatives, brainstorm."
-    model_prefers: ["qwen/qwen3-235b-a22b"]
+    model_prefers: ["openrouter/free"]
     enabled: true
 
   - id: product
     name: "Product Manager"
     role: "Turn ideas into products — plan features, UX, roadmaps."
-    model_prefers: ["qwen/qwen3-235b-a22b"]
+    model_prefers: ["openrouter/free"]
     enabled: true
 
   - id: README
     name: "Documentation Writer"
     role: "Write README, guides, and user documentation."
-    model_prefers: ["qwen/qwen3-235b-a22b"]
+    model_prefers: ["openrouter/free"]
     enabled: true
 
 # Agent communication topology (who can send to whom)
@@ -102,8 +111,9 @@ policy:
   fallback_enabled: true
   max_retries: 3
   escalation_enabled: true
+  paid_model_ok: false
   escalation_models:
-    - "qwen/qwen3-235b-a22b"
+    - "openrouter/free"
 
 memory:
   storage_dir: ".squix"

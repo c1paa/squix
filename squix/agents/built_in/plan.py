@@ -28,7 +28,7 @@ class PlannerAgent(BaseAgent):
     )
 
     async def handle(self, msg: AgentMessage) -> AgentMessage | None:
-        self.progress = "Analyzing task and project structure..."
+        await self.set_progress("Analyzing task and project structure...")
 
         # ── Step 1: ACT (read context) ──
         struct_result = await self.invoke_skill("get_project_structure")
@@ -66,7 +66,7 @@ class PlannerAgent(BaseAgent):
             # Fallback: wrap raw text as single step
             plan = {"steps": [{"agent": "build", "task": msg.content}]}
 
-        self.progress = "Plan created, sending to Orch"
+        await self.set_progress("Plan created, sending to Orch")
 
         return AgentMessage(
             sender=self.agent_id,

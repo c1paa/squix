@@ -16,13 +16,13 @@ class DatabaseAgent(BaseAgent):
     )
 
     async def handle(self, msg: AgentMessage) -> AgentMessage | None:
-        self.progress = f"Knowledge lookup: {msg.content[:50]}"
+        await self.set_progress(f"Knowledge lookup: {msg.content[:50]}")
         messages = [
             {"role": "system", "content": self.system_prompt},
             {"role": "user", "content": msg.content},
         ]
         response = await self.invoke_llm(messages)
-        self.progress = "Lookup complete"
+        await self.set_progress("Lookup complete")
         return AgentMessage(
             sender=self.agent_id,
             recipient="orch",

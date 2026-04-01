@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "squix"
-version = "0.1.0"
+version = "0.2.0"
 description = "AI Agent OS — orchestrate multiple AI models and agents as a managed team"
 requires-python = ">=3.11"
 dependencies = [

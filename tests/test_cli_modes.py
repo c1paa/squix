@@ -89,6 +89,7 @@ class TestModeEngineRouting:
         mock_engine.plan_only = AsyncMock(return_value=[])
         mock_engine.cost_tracker = MagicMock()
         mock_engine.cost_tracker.total_cost = 0.0
+        mock_engine.get_current_progress = MagicMock(return_value="")
 
         # Patch the rich console to avoid terminal output
         with patch("squix.ui.cli.console"):
@@ -119,21 +120,29 @@ class TestModeEngineRouting:
         cli.engine.plan_only.assert_called_once_with("write fib")
 
     @pytest.mark.asyncio
-    async def test_auto_mode_calls_process_input(self):
+    async def test_auto_mode_calls_submit_input(self):
         cli = self._make_cli_with_mode("auto")
-        cli.engine.process_input = AsyncMock(return_value=[])
+        cli.engine.submit_input = AsyncMock(return_value="t001")
+        cli.engine.complete_task = AsyncMock()
+        cli._stream_execution = AsyncMock()
+        cli.engine.project_dir = MagicMock()
+        cli.engine.project_dir.name = "test-project"
 
         with patch("squix.ui.cli.console"):
             await cli._handle_input("write fib")
 
-        cli.engine.process_input.assert_called_once_with("write fib")
+        cli.engine.submit_input.assert_called_once_with("write fib")
 
     @pytest.mark.asyncio
-    async def test_interactive_mode_calls_process_input(self):
+    async def test_interactive_mode_calls_submit_input(self):
         cli = self._make_cli_with_mode("interactive")
-        cli.engine.process_input = AsyncMock(return_value=[])
+        cli.engine.submit_input = AsyncMock(return_value="t001")
+        cli.engine.complete_task = AsyncMock()
+        cli._stream_execution = AsyncMock()
+        cli.engine.project_dir = MagicMock()
+        cli.engine.project_dir.name = "test-project"
 
         with patch("squix.ui.cli.console"):
             await cli._handle_input("debug my code")
 
-        cli.engine.process_input.assert_called_once_with("debug my code")
+        cli.engine.submit_input.assert_called_once_with("debug my code")

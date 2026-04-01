@@ -11,6 +11,7 @@ from squix.agents.base import AgentMessage, AgentState
 from squix.agents.factory import AgentFactory
 from squix.core.config import load as load_config
 from squix.core.session import Session
+from squix.core.session_context import SessionContext
 from squix.memory.manager import MemoryManager
 from squix.models.registry import ModelRegistry
 from squix.observability.cost_tracker import CostTracker
@@ -39,10 +40,12 @@ class SquixEngine:
         self.project_dir = project_dir or Path.cwd()
         self.config = load_config(config_path)
         self.secrets = secrets or {}
+        self.paid_model_ok = self.config.get("policy", {}).get("paid_model_ok", False)
 
         # Subsystems
         self.registry = ModelRegistry(
             self.config.get("models", []),
+            paid_model_ok=self.paid_model_ok,
             **self.secrets,
         )
         self.policy = PolicyEngine(self.config.get("policy", {}))
@@ -59,12 +62,16 @@ class SquixEngine:
         )
         self.primary_tracker = PrimaryFileTracker(self.project_dir)
         self.skills = SkillRegistry(workspace=self.workspace, primary_tracker=self.primary_tracker)
+        self.session_context = SessionContext()
         self.agents: dict[str, Any] = {}
         self._tasks: list[asyncio.Task] = []
         # Result queue — agents put final results here for engine to collect
         self._result_queue: asyncio.Queue[AgentMessage] = asyncio.Queue()
-        # Progress callback for live execution UX: (agent_id, text, task_id) -> None
-        self._progress_cb: Any = None
+        # Progress state for live execution UX
+        self._current_progress: str = ""
+        self._progress_events: list[tuple[str, str, str, str]] = []  # (agent_id, text, task_id, status)
+        # Track current input for context update after completion
+        self._current_user_input: str = ""
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -105,6 +112,10 @@ class SquixEngine:
             primary_tracker=self.primary_tracker,
         )
         self.logger.system(f"Agents loaded: {list(self.agents.keys())}")
+
+        # Wire progress callbacks from engine to each agent
+        for agent in self.agents.values():
+            agent.set_progress_callback(self._on_progress)
 
         # Start agent run loops
         for agent in self.agents.values():
@@ -161,13 +172,8 @@ class SquixEngine:
             "preview": msg.content[:100],
         })
 
-        # Notify UI about agent activity
-        if self._progress_cb:
-            await self._progress_cb(
-                agent_id=msg.sender,
-                text=f"→ {recipient}",
-                task_id=msg.task_id,
-            )
+        # Track delegation in progress state
+        self._current_progress = f"Delegating {msg.sender}→{recipient}"
 
         # Put delegation/forwarding info into the result queue so the UI
         # sees the plan immediately. Use a metadata copy so as not to
@@ -213,12 +219,13 @@ class SquixEngine:
             except asyncio.QueueEmpty:
                 break
 
-        # Send to Talk agent
+        # Send to Talk agent with session context
         msg = AgentMessage(
             sender="user",
             recipient="talk",
             content=user_input,
             task_id=task_id,
+            metadata={"session_context": self.session_context.format_for_talk()},
         )
         talk_agent = self.agents.get("talk")
         if talk_agent is None:
@@ -253,6 +260,111 @@ class SquixEngine:
         self.logger.task_completed(task_id)
         return results
 
+    # ------------------------------------------------------------------
+    # Progress tracking
+    # ------------------------------------------------------------------
+
+    async def _on_progress(self, agent_id: str, text: str, task_id: str) -> None:
+        """Handle progress update from an agent.
+
+        Stores the current progress text and emits it to the result queue
+        so the CLI can display it in real-time.
+        """
+        self._current_progress = text
+        self._progress_events.append((agent_id, text, task_id or "", ""))
+        # Emit to result queue for real-time streaming UI
+        await self._result_queue.put(AgentMessage(
+            sender=agent_id,
+            recipient="user",
+            content=text,
+            task_id=task_id or "",
+            metadata={"type": "progress", "agent_id": agent_id},
+        ))
+
+    def get_current_progress(self) -> str:
+        """Get the latest progress text."""
+        return self._current_progress
+
+    def get_progress_events(self) -> list[tuple[str, str, str, str]]:
+        """Get all progress events since last clear."""
+        events = list(self._progress_events)
+        self._progress_events.clear()
+        return events
+
+    async def submit_input(self, user_input: str) -> str:
+        """Submit input to Talk agent without blocking for results.
+
+        Returns the task_id. The CLI should read from ``_result_queue``
+        directly to stream events in real-time.  Session context is
+        injected into the message metadata so Talk/Orch/workers see
+        what happened earlier in the session.
+        """
+        task_id = self.session.next_task_id() if self.session else "t001"
+        if self.session:
+            self.session.add_task(task_id, user_input)
+        self.logger.task_started(task_id, user_input)
+        self._current_user_input = user_input
+
+        # Drain stale results from previous tasks
+        while not self._result_queue.empty():
+            try:
+                self._result_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+
+        # Clear progress state
+        self._progress_events.clear()
+        self._current_progress = ""
+
+        # Build message with session context
+        msg = AgentMessage(
+            sender="user",
+            recipient="talk",
+            content=user_input,
+            task_id=task_id,
+            metadata={
+                "session_context": self.session_context.format_for_talk(),
+            },
+        )
+        talk_agent = self.agents.get("talk")
+        if talk_agent is None:
+            await self._result_queue.put(AgentMessage(
+                sender="system",
+                recipient="user",
+                content="[error] Talk agent not available",
+                task_id=task_id,
+                metadata={"type": "error"},
+            ))
+            return task_id
+
+        await talk_agent.put_message(msg)
+        return task_id
+
+    def update_session_context(
+        self,
+        response: str,
+        files: list[str] | None = None,
+        agent_chain: list[str] | None = None,
+    ) -> None:
+        """Update session context after a task completes.
+
+        Called by the CLI after streaming finishes so subsequent tasks
+        have full conversation history.
+        """
+        self.session_context.add_exchange(
+            user_input=self._current_user_input,
+            response=response,
+            agent_chain=agent_chain,
+            files=files,
+        )
+
+    async def complete_task(self, task_id: str) -> None:
+        """Mark a task as complete in the session."""
+        if self.session:
+            self.session.complete_task(task_id)
+            await self.memory.save_session(self.session)
+        self.logger.task_completed(task_id)
+
     async def chat_only(self, user_input: str) -> list[AgentMessage]:
         """Direct LLM chat response — no delegation, no pipeline.
 
@@ -273,11 +385,14 @@ class SquixEngine:
             )]
 
         import re
+        context = self.session_context.format_for_talk()
         system_prompt = (
             "You are Squix — a helpful AI assistant. "
             "Answer concisely and naturally. "
             "If you don't know something, say so briefly."
         )
+        if context:
+            system_prompt += f"\n\n{context}"
         messages = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_input},
