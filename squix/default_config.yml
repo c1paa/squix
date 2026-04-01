@@ -1,0 +1,177 @@
+# Squix — Default Configuration
+# This file defines the default model registry, agent setup, and policy rules.
+
+models:
+  # OpenRouter models
+  - id: openrouter/anthropic/claude-sonnet-4-20250514
+    provider: openrouter
+    name: "Claude Sonnet 4"
+    cost_per_1k_input: 0.003
+    cost_per_1k_output: 0.015
+    context_limit: 200000
+    specialization: ["code", "reasoning", "general"]
+    daily_limit: null
+    monthly_limit: null
+    priority: 5
+
+  - id: openrouter/anthropic/claude-opus-4-20250514
+    provider: openrouter
+    name: "Claude Opus 4"
+    cost_per_1k_input: 0.015
+    cost_per_1k_output: 0.075
+    context_limit: 200000
+    specialization: ["complex-reasoning", "architecture"]
+    daily_limit: 100  # USD
+    monthly_limit: 2000
+    priority: 1
+
+  - id: openrouter/openai/gpt-4.1
+    provider: openrouter
+    name: "GPT-4.1"
+    cost_per_1k_input: 0.002
+    cost_per_1k_output: 0.008
+    context_limit: 1047576
+    specialization: ["general", "writing"]
+    daily_limit: null
+    monthly_limit: null
+    priority: 4
+
+  # Cheap models for routine tasks
+  - id: openrouter/google/gemini-2.0-flash-exp:free
+    provider: openrouter
+    name: "Gemini 2.0 Flash (free)"
+    cost_per_1k_input: 0.0
+    cost_per_1k_output: 0.0
+    context_limit: 1048576
+    specialization: ["simple", "summarization", "general"]
+    daily_limit: null
+    monthly_limit: null
+    priority: 10
+
+  # Ollama (local)
+  - id: ollama/llama3.1:8b
+    provider: ollama
+    name: "Llama 3.1 (8B local)"
+    cost_per_1k_input: 0.0
+    cost_per_1k_output: 0.0
+    context_limit: 8192
+    specialization: ["simple", "code", "general"]
+    daily_limit: null
+    monthly_limit: null
+    priority: 8
+
+  - id: ollama/qwen2.5:32b
+    provider: ollama
+    name: "Qwen 2.5 (32B local)"
+    cost_per_1k_input: 0.0
+    cost_per_1k_output: 0.0
+    context_limit: 32768
+    specialization: ["code", "reasoning", "general"]
+    daily_limit: null
+    monthly_limit: null
+    priority: 7
+
+agents:
+  - id: plan
+    name: "Planner"
+    role: "Break large tasks into actionable steps and control the orchestrator."
+    model_prefers: ["openrouter/anthropic/claude-sonnet-4-20250514", "openrouter/openai/gpt-4.1"]
+    enabled: true
+
+  - id: orch
+    name: "Orchestrator"
+    role: "Main task dispatcher — receives steps from planner and routes them to worker agents."
+    model_prefers: ["openrouter/anthropic/claude-sonnet-4-20250514", "openrouter/openai/gpt-4.1"]
+    enabled: true
+
+  - id: build
+    name: "Builder"
+    role: "Write code, implement solutions, create artifacts."
+    model_prefers: ["openrouter/anthropic/claude-sonnet-4-20250514", "ollama/qwen2.5:32b"]
+    enabled: true
+    count: 1
+
+  - id: debug
+    name: "Debugger"
+    role: "Find bugs, fix errors, improve code quality."
+    model_prefers: ["openrouter/anthropic/claude-sonnet-4-20250514", "ollama/qwen2.5:32b"]
+    enabled: true
+    count: 1
+
+  - id: web
+    name: "Web Researcher"
+    role: "Search the internet for information, documentation, and references."
+    model_prefers: ["openrouter/google/gemini-2.0-flash-exp:free"]
+    enabled: true
+
+  - id: DB
+    name: "Knowledge Base"
+    role: "Manage project knowledge, documentation database, and structured information."
+    model_prefers: ["openrouter/google/gemini-2.0-flash-exp:free", "ollama/llama3.1:8b"]
+    enabled: true
+
+  - id: AI
+    name: "AI Specialist"
+    role: "Handle ML, AI, model-related tasks and advice."
+    model_prefers: ["openrouter/anthropic/claude-sonnet-4-20250514", "openrouter/openai/gpt-4.1"]
+    enabled: true
+
+  - id: idea
+    name: "Idea Explorer"
+    role: "Discuss project ideas, propose alternatives, brainstorm."
+    model_prefers: ["openrouter/google/gemini-2.0-flash-exp:free", "openrouter/openai/gpt-4.1"]
+    enabled: true
+
+  - id: product
+    name: "Product Manager"
+    role: "Turn ideas into products — plan features, UX, roadmaps."
+    model_prefers: ["openrouter/anthropic/claude-sonnet-4-20250514", "openrouter/openai/gpt-4.1"]
+    enabled: true
+
+  - id: README
+    name: "Documentation Writer"
+    role: "Write README, guides, and user documentation."
+    model_prefers: ["openrouter/google/gemini-2.0-flash-exp:free", "openrouter/openai/gpt-4.1"]
+    enabled: true
+
+# Agent communication topology (who can send to whom)
+agent_links:
+  idea: ["product", "web"]
+  product: ["web", "DB", "plan", "orch"]
+  web: ["product", "DB", "orch", "idea"]
+  plan: ["product", "orch"]
+  DB: ["web", "product", "orch"]
+  orch: ["AI", "README", "debug", "build", "plan", "product", "web", "DB"]
+  build: ["debug", "AI", "orch"]
+  debug: ["orch", "build", "AI"]
+  AI: ["orch", "build", "debug"]
+  README: ["orch"]
+
+policy:
+  # Route simple tasks to cheap/free models
+  cheap_model_threshold: 500  # tokens above which we avoid cheap models
+  # Fallback: if a model fails, try the next in preference list
+  fallback_enabled: true
+  max_retries: 3
+  # Escalation: if confidence is low, use a powerful model
+  escalation_enabled: true
+  escalation_models:
+    - "openrouter/anthropic/claude-opus-4-20250514"
+    - "openrouter/anthropic/claude-sonnet-4-20250514"
+
+memory:
+  # Where to persist agent state, task history, and project memory
+  storage_dir: ".squix"
+  session_dir: ".squix/sessions"
+  auto_save_interval: 30  # seconds
+
+observability:
+  # Logging level and output
+  log_level: "INFO"
+  show_costs: true
+  show_agent_status: true
+
+workspace:
+  # Project workspace defaults to current directory
+  root: "."
+  artifacts_dir: ".squix/artifacts"

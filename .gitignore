@@ -1,0 +1,54 @@
+# Byte-compiled / optimized / distributed files
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+*.egg
+build/
+dist/
+*.wheel
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*~
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Squix runtime data (DO NOT commit)
+.squix/
+
+# User config (may contain sensitive data)
+squix.yml
+squix.secret.yml
+*.key
+
+# Secrets env
+.env
+
+# Logs
+*.log
+logs/
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.coverage.*
+
+# Type checkers
+.mypy_cache/
+.dmypy.json
+dmypy.json
+.ruff_cache/
