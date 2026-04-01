@@ -7,6 +7,7 @@ import logging
 from pathlib import Path
 from typing import Any
 
+from squix.agents.base import AgentMessage, AgentState
 from squix.agents.factory import AgentFactory
 from squix.core.config import load as load_config
 from squix.core.session import Session
@@ -18,6 +19,9 @@ from squix.policy.engine import PolicyEngine
 from squix.workspace.manager import WorkspaceManager
 
 logger = logging.getLogger("squix.core.engine")
+
+# Default timeout for waiting on agent responses (seconds)
+_STEP_TIMEOUT = 60
 
 
 class SquixEngine:
@@ -52,6 +56,10 @@ class SquixEngine:
         )
         self.agents: dict[str, Any] = {}
         self._tasks: list[asyncio.Task] = []
+        # Result queue — agents put final results here for engine to collect
+        self._result_queue: asyncio.Queue[AgentMessage] = asyncio.Queue()
+        # Event callback for UI to show real-time agent activity
+        self._on_agent_event: Any = None
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -72,8 +80,22 @@ class SquixEngine:
         else:
             self.session = await self.memory.create_session()
 
-        # Create all agents
-        self.agents = self.agent_factory.create_all(self.registry)
+        # Configure file logging → session dir
+        mem = self.config.get("memory", {}).get("storage_dir", ".squix")
+        log_dir = (
+            Path(self.project_dir) / mem / "sessions" / self.session.session_id
+        )
+        log_path = log_dir / "squix.log"
+        self.logger.configure(log_path)
+
+        # Create all agents with full wiring
+        self.agents = self.agent_factory.create_all(
+            registry=self.registry,
+            send_fn=self._route_message,
+            result_queue=self._result_queue,
+            cost_tracker=self.cost_tracker,
+            policy=self.policy,
+        )
         self.logger.system(f"Agents loaded: {list(self.agents.keys())}")
 
         # Start agent run loops
@@ -103,125 +125,156 @@ class SquixEngine:
         self.logger.system("Squix stopped.")
 
     # ------------------------------------------------------------------
-    # Task submission
+    # Message routing
     # ------------------------------------------------------------------
 
-    async def submit_task(self, user_input: str) -> dict[str, Any]:
-        """Submit a user task and run the full pipeline: plan → orchestrate → execute."""
+    async def _route_message(self, msg: AgentMessage) -> None:
+        """Route a message from one agent to another via their inbox queues."""
+        recipient = msg.recipient
+        if recipient == "user":
+            await self._result_queue.put(msg)
+            return
+
+        agent = self.agents.get(recipient)
+        if agent is None:
+            logger.warning("No agent '%s' found, routing to result queue", recipient)
+            msg.metadata["routing_error"] = f"Agent '{recipient}' not found"
+            await self._result_queue.put(msg)
+            return
+
+        self.logger.event("route", {
+            "from": msg.sender,
+            "to": recipient,
+            "task_id": msg.task_id,
+            "preview": msg.content[:100],
+        })
+
+        # Notify UI about agent activity
+        if self._on_agent_event:
+            self._on_agent_event(msg.sender, recipient, "routing")
+
+        await agent.put_message(msg)
+
+    # ------------------------------------------------------------------
+    # Main user interaction
+    # ------------------------------------------------------------------
+
+    async def process_input(self, user_input: str) -> list[AgentMessage]:
+        """Process user input through the Talk agent and collect all results.
+
+        Talk classifies the input and either responds directly or delegates
+        to other agents. Results flow back through the result queue.
+        """
         task_id = self.session.next_task_id() if self.session else "t001"
+
+        # Track in session
+        if self.session:
+            self.session.add_task(task_id, user_input)
 
         self.logger.task_started(task_id, user_input)
 
-        # Step 1: Planner breaks it down
-        from squix.agents.base import AgentMessage
+        # Drain any stale results from previous tasks
+        while not self._result_queue.empty():
+            try:
+                self._result_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
 
-        plan_msg = AgentMessage(
+        # Send to Talk agent
+        msg = AgentMessage(
             sender="user",
-            recipient="plan",
+            recipient="talk",
             content=user_input,
             task_id=task_id,
         )
-        await self.agents["plan"].put_message(plan_msg)
+        talk_agent = self.agents.get("talk")
+        if talk_agent is None:
+            return [AgentMessage(
+                sender="system",
+                recipient="user",
+                content="[error] Talk agent not available",
+                task_id=task_id,
+                metadata={"type": "error"},
+            )]
 
-        # Step 2: Wait for plan to come back from orchestrator
-        result = await self._run_dispatch_loop(task_id, user_input)
+        await talk_agent.put_message(msg)
+
+        # Collect results — wait for responses with timeout
+        results: list[AgentMessage] = []
+        try:
+            results = await self._collect_results(task_id)
+        except asyncio.TimeoutError:
+            results.append(AgentMessage(
+                sender="system",
+                recipient="user",
+                content="[timeout] Task took too long to complete",
+                task_id=task_id,
+                metadata={"type": "error"},
+            ))
+
+        # Complete task in session
+        if self.session:
+            self.session.complete_task(task_id)
+            await self.memory.save_session(self.session)
 
         self.logger.task_completed(task_id)
-        return result
+        return results
 
-    async def _run_dispatch_loop(self, task_id: str, user_input: str) -> dict[str, Any]:
-        """Internal dispatch loop: plan → parse steps → send to workers → collect results."""
-        from squix.agents.base import AgentMessage
+    async def _collect_results(self, task_id: str) -> list[AgentMessage]:
+        """Collect results from the result queue for a specific task.
 
-        # This is a simplified synchronous-ish dispatch for MVP.
-        # In a fuller version the orchestrator would manage the entire flow.
-        results: list[dict[str, Any]] = []
+        Waits for results with a timeout. Stops when:
+        - A final result (type=chat or type=result) is received
+        - Or timeout is reached
+        """
+        results: list[AgentMessage] = []
+        # Keep collecting until we get a final result or timeout
+        deadline = _STEP_TIMEOUT
+        while True:
+            try:
+                msg = await asyncio.wait_for(
+                    self._result_queue.get(), timeout=deadline
+                )
+                # Only collect messages for this task (or accept all if task_id empty)
+                if msg.task_id and msg.task_id != task_id:
+                    continue
+                results.append(msg)
 
-        # Ask planner — it returns a plan message
-        plan_response = await self.agents["plan"].handle(
-            AgentMessage(sender="user", recipient="plan", content=user_input, task_id=task_id)
-        )
+                msg_type = msg.metadata.get("type", "")
 
-        if not plan_response:
-            return {"error": "Planner returned no plan", "task_id": task_id}
+                # If it's a direct chat response from talk, we're done
+                if msg_type == "chat":
+                    break
 
-        # Parse the plan
-        plan_text = plan_response.content
-        self.logger.event("plan_created", {"task_id": task_id, "plan": plan_text[:200]})
+                # If it's an error, we're done
+                if msg_type == "error":
+                    break
 
-        # Parse steps from the plan (try JSON, fallback to text)
-        steps = self._extract_steps(plan_text)
+                # If it's a final result from orch, we're done
+                if msg_type == "final_result":
+                    break
 
-        # Dispatch each step to the right agent
-        for step in steps:
-            target = step.get("agent", "build")
-            task_text = step.get("task", "")
+                # If it's a delegation result (intermediate), continue collecting
+                # but with shorter timeout for subsequent results
+                if msg_type == "result":
+                    # This is a worker result — might be followed by more
+                    # Give 5s for more results, then stop
+                    deadline = 5
+                    continue
 
-            if target not in self.agents:
-                self.logger.warning(f"Agent '{target}' not found, defaulting to 'build'")
-                target = "build"
+                # For other types, keep waiting with shorter timeout
+                deadline = _STEP_TIMEOUT
 
-            self.logger.event("dispatch", {
-                "task_id": task_id,
-                "step": step,
-                "target": target,
-            })
+            except asyncio.TimeoutError:
+                if results:
+                    break
+                raise
 
-            # Pick model for this agent via policy
-            model_id = self.policy.select_model(target, self.registry)
+        return results
 
-            # Ask the agent
-            agent = self.agents[target]
-            agent_msg = AgentMessage(
-                sender="orch",
-                recipient=target,
-                content=task_text,
-                task_id=task_id,
-            )
-            response = await agent.handle(agent_msg)
-
-            if response:
-                # Track cost if LLM call happened
-                if "llm_messages" in response.metadata:
-                    # In real flow, the adapter would be called here
-                    pass
-                results.append({
-                    "agent": target,
-                    "response": response.content,
-                    "model": model_id,
-                })
-
-        return {
-            "task_id": task_id,
-            "plan": plan_text,
-            "results": results,
-        }
-
-    @staticmethod
-    def _extract_steps(plan_text: str) -> list[dict[str, str]]:
-        """Try to parse JSON steps from plan; fallback to naive line splitting."""
-        import json
-        import re
-
-        # Try JSON first
-        try:
-            data = json.loads(plan_text)
-            if isinstance(data, dict) and "steps" in data:
-                return data["steps"]
-            if isinstance(data, list):
-                return data
-        except (json.JSONDecodeError, TypeError):
-            pass
-
-        # Fallback: numbered lines or bullet points
-        steps = []
-        lines = re.split(r'\n\s*[\d\-\*•]+\.?\s*', plan_text)
-        for line in lines:
-            line = line.strip()
-            if line and len(line) > 5:
-                steps.append({"agent": "build", "task": line})
-
-        return steps if steps else [{"agent": "build", "task": plan_text}]
+    # ------------------------------------------------------------------
+    # Status
+    # ------------------------------------------------------------------
 
     def get_status(self) -> dict[str, Any]:
         """Return current system status for CLI display."""
@@ -230,6 +283,8 @@ class SquixEngine:
             agent_states[aid] = {
                 "state": agent.state.value,
                 "progress": agent.progress,
+                "model": agent.model_prefers[0] if agent.model_prefers else "—",
+                "neighbors": agent.neighbors,
             }
         return {
             "session": self.session.session_id if self.session else None,
@@ -237,3 +292,10 @@ class SquixEngine:
             "total_cost": self.cost_tracker.total_cost,
             "tasks_completed": self.session.tasks_completed if self.session else 0,
         }
+
+    def get_active_chain(self) -> list[str]:
+        """Return list of currently working agents (for UI display)."""
+        return [
+            aid for aid, agent in self.agents.items()
+            if agent.state == AgentState.WORKING
+        ]

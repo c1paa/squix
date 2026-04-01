@@ -16,14 +16,17 @@ class WebAgent(BaseAgent):
     )
 
     async def handle(self, msg: AgentMessage) -> AgentMessage | None:
+        self.progress = f"Researching: {msg.content[:50]}"
         messages = [
             {"role": "system", "content": self.system_prompt},
             {"role": "user", "content": msg.content},
         ]
+        response = await self.invoke_llm(messages)
+        self.progress = "Research complete"
         return AgentMessage(
             sender=self.agent_id,
             recipient="orch",
-            content=f"[web] {msg.content}",
+            content=response.text,
             task_id=msg.task_id,
-            metadata={"type": "work", "llm_messages": messages},
+            metadata={"type": "work"},
         )

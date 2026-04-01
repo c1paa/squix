@@ -15,14 +15,28 @@ class IdeaAgent(BaseAgent):
     )
 
     async def handle(self, msg: AgentMessage) -> AgentMessage | None:
+        self.progress = f"Brainstorming: {msg.content[:50]}"
         messages = [
             {"role": "system", "content": self.system_prompt},
             {"role": "user", "content": msg.content},
         ]
+        response = await self.invoke_llm(messages)
+        self.progress = "Ideas ready"
+
+        # If delegated from talk, send result back to user
+        if msg.metadata.get("original_sender") == "user":
+            return AgentMessage(
+                sender=self.agent_id,
+                recipient="user",
+                content=response.text,
+                task_id=msg.task_id,
+                metadata={"type": "result"},
+            )
+
         return AgentMessage(
             sender=self.agent_id,
             recipient="orch",
-            content=f"[idea] {msg.content}",
+            content=response.text,
             task_id=msg.task_id,
-            metadata={"type": "work", "llm_messages": messages},
+            metadata={"type": "work"},
         )

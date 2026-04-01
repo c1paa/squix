@@ -32,10 +32,14 @@ def main() -> None:
         format="%(asctime)s [%(name)s] %(levelname)s %(message)s",
     )
 
-    # Gather secrets from environment
+    # Gather secrets from environment (accept both OPENROUTER_API_KEY and OPENAI_API_KEY)
     secrets = {}
-    if key := os.environ.get("OPENROUTER_API_KEY"):
-        secrets["openrouter_api_key"] = key
+    api_key = (
+        os.environ.get("OPENROUTER_API_KEY")
+        or os.environ.get("OPENAI_API_KEY")
+    )
+    if api_key:
+        secrets["openrouter_api_key"] = api_key
 
     # Build and run the engine + CLI
     from squix.core.engine import SquixEngine

@@ -15,7 +15,7 @@ logger = logging.getLogger("squix.api.openrouter")
 class OpenRouterAdapter(ModelAdapter):
     """Adapter for the OpenRouter API."""
 
-    API_URL = "https://openrouter.ai/api/v1/chat/completions"
+    API_URL = "https://openrouter.ai/api/v1"
 
     def __init__(self, model_id: str, *, api_key: str, **kwargs: Any) -> None:
         super().__init__(model_id, **kwargs)
@@ -52,7 +52,7 @@ class OpenRouterAdapter(ModelAdapter):
         logger.debug("OpenRouter request → model=%s tokens~=%s",
                       self.model_id, len(messages))
 
-        resp = await self._session.post("", json=payload)
+        resp = await self._session.post("/chat/completions", json=payload)
         resp.raise_for_status()
         data = resp.json()
 
@@ -77,7 +77,7 @@ class OpenRouterAdapter(ModelAdapter):
 
     async def health_check(self) -> bool:
         try:
-            resp = await self._session.get("https://openrouter.ai/api/v1/auth/key")
+            resp = await self._session.get("/auth/key")
             return resp.status_code == 200
         except Exception:
             logger.exception("OpenRouter health check failed")

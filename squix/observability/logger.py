@@ -1,4 +1,4 @@
-"""Structured logging and event emission for Squix."""
+"""Structured logging — all logs go to FILE only. CLI output is explicit."""
 
 from __future__ import annotations
 
@@ -7,13 +7,13 @@ import logging
 from pathlib import Path
 from typing import Any
 
-from rich.console import Console
-
-console = Console()
+logger = logging.getLogger("squix.events")
 
 
 class SquixLogger:
-    """Handles structured logging and rich CLI output."""
+    """All structured logging → FILE only. No console prints.
+    The CLI itself decides what to show the user.
+    """
 
     def __init__(self, config: dict[str, Any] | None = None) -> None:
         self.config = config or {}
@@ -21,9 +21,12 @@ class SquixLogger:
         self.show_agent_status = self.config.get("show_agent_status", True)
         self.log_level = self.config.get("log_level", "INFO")
         self._log_path: Path | None = None
+        self._configured = False
 
     def configure(self, log_path: Path) -> None:
-        """Set the log file path and configure file+console handlers."""
+        """Set up file-only logging. Nothing goes to stdout."""
+        if self._configured:
+            return
         self._log_path = log_path
         log_path.parent.mkdir(parents=True, exist_ok=True)
         logging.basicConfig(
@@ -32,47 +35,35 @@ class SquixLogger:
             handlers=[
                 logging.FileHandler(log_path),
             ],
+            force=True,
         )
+        self._configured = True
 
-    # ---- High-level Squix events ----
+    # ---- Everything goes to FILE only ----
 
     def system(self, message: str) -> None:
-        """Print a system startup/status message."""
-        console.print(f"[bold cyan]⚙  {message}[/bold cyan]")
+        logger.info(f"SYSTEM: {message}")
 
     def task_started(self, task_id: str, text: str) -> None:
-        """Print task start banner."""
-        console.print(f"\n[bold green]▶  Task {task_id}[/bold green]: {text}")
+        logger.info(f"TASK_START: {task_id} | {text}")
 
     def task_completed(self, task_id: str) -> None:
-        """Print task completion banner."""
-        console.print(f"[bold green]✓  Task {task_id} completed[/bold green]")
+        logger.info(f"TASK_DONE: {task_id}")
 
     def agent_dispatch(self, agent_id: str, task_text: str) -> None:
-        """Print agent dispatch event."""
-        if self.show_agent_status:
-            console.print(f"  [blue]→ {agent_id}[/blue]: {task_text[:80]}")
+        logger.info(f"DISPATCH: {agent_id} | {task_text[:200]}")
 
     def agent_result(self, agent_id: str, result: str) -> None:
-        """Print agent result."""
-        if self.show_agent_status:
-            preview = result[:120] + "..." if len(result) > 120 else result
-            console.print(f"  [dim]← {agent_id}:[/dim] {preview}")
+        logger.info(f"RESULT: {agent_id} | {result[:300]}")
 
     def event(self, event_type: str, data: dict[str, Any]) -> None:
-        """Log a structured event to the file logger."""
-        logger = logging.getLogger("squix.events")
         logger.info(json.dumps({"type": event_type, "data": data}, default=str))
 
     def cost(self, model: str, cost: float) -> None:
-        """Print cost update."""
-        if self.show_costs:
-            console.print(f"  [yellow]$  {model}:[/yellow] ${cost:.6f}")
+        logger.info(f"COST: {model} | ${cost:.6f}")
 
     def error(self, message: str) -> None:
-        """Print error."""
-        console.print(f"[bold red]✗  ERROR: {message}[/bold red]")
+        logger.error(f"ERROR: {message}")
 
     def warning(self, message: str) -> None:
-        """Print warning."""
-        console.print(f"[bold yellow]⚠  {message}[/bold yellow]")
+        logger.warning(f"WARNING: {message}")

@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 from squix.models.registry import ModelRegistry
+
+logger = logging.getLogger("squix.policy")
 
 
 class PolicyEngine:
@@ -31,19 +34,19 @@ class PolicyEngine:
         Returns a model_id or None if no model is available.
         """
         if escalated and self.escalation_models:
-            return self.escalation_models[0]
+            for mid in self.escalation_models:
+                adapter = registry.get_adapter(mid)
+                if adapter is not None:
+                    return mid
 
-        # Ask the agent's preference first
-        # Actually we need access to agent's model_prefers — the factory passes this
-        # But here we look it up from the config indirectly
-        # For now, the registry's specialization lookup is the primary method
+        # Fallback: return first available model
+        model_ids = registry.get_model_ids()
+        for mid in model_ids:
+            adapter = registry.get_adapter(mid)
+            if adapter is not None:
+                return mid
 
-        # Get agent's preferred models (passed via agent config, looked up by registry)
-        # We use the agent's role to guess — but better: the agent object has model_prefers
-        # This method is called by the engine which has access to the agent
-        # So we do a simple round-robin over the agent's preferred list
-        # Actually, let's fix this: the engine passes the agent's prefs
-        return None  # placeholder — the engine overrides this
+        return None
 
     def select_model_for_agent(
         self,
@@ -57,6 +60,17 @@ class PolicyEngine:
             adapter = registry.get_adapter(mid)
             if adapter is not None:
                 return mid
+
+        # Fallback to any available model
+        model_ids = registry.get_model_ids()
+        for mid in model_ids:
+            adapter = registry.get_adapter(mid)
+            if adapter is not None:
+                logger.warning(
+                    "No preferred model available, falling back to %s", mid
+                )
+                return mid
+
         return None
 
     def should_fallback(self, error: str, attempt: int) -> bool:
@@ -77,6 +91,14 @@ class PolicyEngine:
                 adapter = registry.get_adapter(mid)
                 if adapter is not None:
                     return mid
+
+        # Try any model in registry
+        for mid in registry.get_model_ids():
+            if mid != current_model:
+                adapter = registry.get_adapter(mid)
+                if adapter is not None:
+                    return mid
+
         return None
 
     def needs_escalation(self, confidence: float | None) -> bool:
