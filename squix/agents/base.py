@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import re
 from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
@@ -327,6 +329,211 @@ class BaseAgent(ABC):
                     model_id=model_id,
                     cost=0.0,
                 )
+
+    # ── Agentic Loop ────────────────────────────────────────────────────
+
+    async def run_agentic_loop(
+        self,
+        task: str,
+        system_prompt: str,
+        available_skills: list[str] | None = None,
+        max_iterations: int = 15,
+        max_tokens: int = 8192,
+        temperature: float = 0.3,
+    ) -> tuple[str, list[dict[str, Any]]]:
+        """Run an agentic tool-use loop: LLM → parse tool calls → execute → repeat.
+
+        Returns (final_text, tool_log) where tool_log is a list of
+        {tool, params, result, iteration} dicts.
+        """
+        # Build tools description from available skills
+        if self._skills and available_skills:
+            skill_defs = self._skills.list_allowed(self.agent_id)
+            skill_defs = [s for s in skill_defs if s.name in available_skills]
+        elif self._skills:
+            skill_defs = self._skills.list_allowed(self.agent_id)
+        else:
+            skill_defs = []
+
+        tools_desc = self._format_tools_for_prompt(skill_defs)
+
+        full_system = (
+            f"{system_prompt}\n\n"
+            f"## Available Tools\n\n{tools_desc}\n\n"
+            "## How to call tools\n\n"
+            "To use a tool, respond with ONLY a JSON array (no other text before or after):\n\n"
+            '```json\n[{"tool": "tool_name", "params": {"key": "value"}}]\n```\n\n'
+            "You can call multiple tools in one response.\n"
+            "After each tool call, you will receive the tool results. Then decide: call more tools or give your final answer.\n\n"
+            "## CRITICAL RULES\n\n"
+            "1. Each response is EITHER a tool call OR your final text answer. NEVER both.\n"
+            "2. If you need to write/edit a file — call the tool. Do NOT output code as text.\n"
+            "3. When the task is COMPLETE, respond with a plain text summary (no JSON, no tool calls).\n"
+            "4. For write_file: the 'content' param must contain the COMPLETE file content.\n"
+            "5. For edit_file: you MUST call read_file first. old_string must match EXACTLY.\n"
+        )
+
+        messages: list[dict[str, str]] = [
+            {"role": "system", "content": full_system},
+            {"role": "user", "content": task},
+        ]
+
+        tool_log: list[dict[str, Any]] = []
+        prev_calls_key: str = ""
+
+        for iteration in range(1, max_iterations + 1):
+            await self.set_progress(f"Thinking (iteration {iteration})…")
+
+            response = await self.invoke_llm(
+                messages, temperature=temperature, max_tokens=max_tokens,
+            )
+            text = response.text.strip()
+
+            # Parse tool calls from response
+            calls = self._parse_tool_calls(text)
+
+            if not calls:
+                # No tool calls → this is the final answer
+                return text, tool_log
+
+            # Detect infinite loop (same calls as last iteration)
+            calls_key = json.dumps(calls, sort_keys=True)
+            if calls_key == prev_calls_key:
+                logger.warning("Agent %s: loop detected, breaking", self.agent_id)
+                return text, tool_log
+            prev_calls_key = calls_key
+
+            # Execute each tool call
+            await self.set_progress(
+                f"Executing {len(calls)} tool(s) (iteration {iteration})"
+            )
+            messages.append({"role": "assistant", "content": text})
+
+            results_text_parts: list[str] = []
+            for call in calls:
+                tool_name = call.get("tool", "")
+                params = call.get("params", {})
+
+                result = await self.invoke_skill(tool_name, params)
+                tool_log.append({
+                    "tool": tool_name,
+                    "params": params,
+                    "result": result,
+                    "iteration": iteration,
+                })
+
+                # Format result for feeding back to LLM
+                result_str = json.dumps(result, ensure_ascii=False, default=str)
+                # Truncate very long results
+                if len(result_str) > 12000:
+                    result_str = result_str[:12000] + "... [truncated]"
+                results_text_parts.append(
+                    f"[{tool_name}] {result_str}"
+                )
+
+            # Feed results back as a user message (tool results)
+            results_msg = "\n\n".join(results_text_parts)
+            messages.append({
+                "role": "user",
+                "content": f"Tool results:\n\n{results_msg}",
+            })
+
+        # Hit max iterations — return last LLM text
+        logger.warning(
+            "Agent %s: max iterations (%d) reached", self.agent_id, max_iterations,
+        )
+        return messages[-1].get("content", "Max iterations reached."), tool_log
+
+    @staticmethod
+    def _parse_tool_calls(text: str) -> list[dict[str, Any]]:
+        """Extract tool calls from LLM response text.
+
+        Uses brace-matching to handle nested JSON (e.g. code with braces in params).
+        Returns empty list if no tool calls found (= final answer).
+        """
+        def _find_balanced(s: str, start: int, open_ch: str, close_ch: str) -> int:
+            """Find index of matching close bracket. Returns -1 if not found."""
+            depth = 0
+            in_string = False
+            escape = False
+            for i in range(start, len(s)):
+                ch = s[i]
+                if escape:
+                    escape = False
+                    continue
+                if ch == "\\":
+                    escape = True
+                    continue
+                if ch == '"' and not escape:
+                    in_string = not in_string
+                    continue
+                if in_string:
+                    continue
+                if ch == open_ch:
+                    depth += 1
+                elif ch == close_ch:
+                    depth -= 1
+                    if depth == 0:
+                        return i
+            return -1
+
+        def _try_parse_tool_array(s: str) -> list[dict[str, Any]] | None:
+            """Try to parse a string as a tool call array."""
+            try:
+                parsed = json.loads(s)
+            except (json.JSONDecodeError, ValueError):
+                return None
+            if isinstance(parsed, list) and parsed and all(
+                isinstance(c, dict) and "tool" in c for c in parsed
+            ):
+                return parsed
+            if isinstance(parsed, dict) and "tool" in parsed:
+                return [parsed]
+            return None
+
+        # Strategy 1: Extract from ```json ... ``` code blocks
+        for m in re.finditer(r"```(?:json)?\s*\n?", text):
+            block_start = m.end()
+            block_end = text.find("```", block_start)
+            if block_end == -1:
+                continue
+            block = text[block_start:block_end].strip()
+            result = _try_parse_tool_array(block)
+            if result:
+                return result
+
+        # Strategy 2: Find [ that starts a tool call array using brace matching
+        for m in re.finditer(r'\[\s*\{\s*"tool"', text):
+            start = m.start()
+            end = _find_balanced(text, start, "[", "]")
+            if end != -1:
+                result = _try_parse_tool_array(text[start:end + 1])
+                if result:
+                    return result
+
+        # Strategy 3: Find standalone {"tool": ...} object using brace matching
+        for m in re.finditer(r'\{\s*"tool"\s*:', text):
+            start = m.start()
+            end = _find_balanced(text, start, "{", "}")
+            if end != -1:
+                result = _try_parse_tool_array(text[start:end + 1])
+                if result:
+                    return result
+
+        return []
+
+    @staticmethod
+    def _format_tools_for_prompt(skill_defs: list) -> str:
+        """Format skill definitions into a concise prompt block."""
+        lines = []
+        for s in skill_defs:
+            params_desc = ", ".join(
+                f"{p.name}: {p.description}"
+                for p in s.params
+            )
+            danger = " ⚠️" if s.is_dangerous else ""
+            lines.append(f"- **{s.name}**({params_desc}): {s.description}{danger}")
+        return "\n".join(lines) if lines else "No tools available."
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize agent state for memory persistence."""

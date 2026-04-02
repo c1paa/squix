@@ -69,12 +69,15 @@ class OrchestratorAgent(BaseAgent):
 
         await self.set_progress(f"Dispatching to {worker}")
 
-        # Step 2: Dispatch with session context
+        # Step 2: Reformulate task for the worker — make it clear and actionable
+        worker_task = await self._reformulate_for_worker(task, worker, task_type)
+
+        # Step 3: Dispatch with session context
         session_ctx = msg.metadata.get("session_context", "")
         step_msg = AgentMessage(
             sender=self.agent_id,
             recipient=worker,
-            content=task,
+            content=worker_task,
             task_id=msg.task_id,
             metadata={
                 "type": "step",
@@ -107,10 +110,16 @@ class OrchestratorAgent(BaseAgent):
             logger.warning(
                 "Result validation failed for %s: %s", worker, error_reason,
             )
-            # Retry once
+
+            # If build failed with syntax errors, try debug to fix
+            retry_worker = worker
+            if worker == "build" and "syntax" in error_reason.lower():
+                retry_worker = "debug"
+                await self.set_progress("Build had syntax errors, dispatching to debug")
+
             step_msg2 = AgentMessage(
                 sender=self.agent_id,
-                recipient=worker,
+                recipient=retry_worker,
                 content=(
                     f"Previous attempt did not meet the result contract. "
                     f"Error: {error_reason}.\n\n"
@@ -119,20 +128,23 @@ class OrchestratorAgent(BaseAgent):
                     f"structured output with status and the requested artifacts."
                 ),
                 task_id=msg.task_id,
-                metadata={"type": "step", "orch_retry": True},
+                metadata={
+                    "type": "step", "orch_retry": True,
+                    "session_context": session_ctx,
+                },
             )
             await self._send_fn(step_msg2)
 
             try:
                 result_msg2 = await asyncio.wait_for(
-                    self._inbox.get(), timeout=60,
+                    self._inbox.get(), timeout=120,
                 )
                 result_content = result_msg2.content
                 result_meta = result_msg2.metadata
             except TimeoutError:
                 return self._format_failure(
                     task, msg.task_id,
-                    f"Worker '{worker}' timeded out on retry",
+                    f"Worker '{retry_worker}' timed out on retry",
                 )
 
         # Step 5: Verify files exist (if files were claimed)
@@ -242,6 +254,14 @@ class OrchestratorAgent(BaseAgent):
             return "web"
         if task_type == "docs_write":
             return "README"
+        if task_type == "product_discussion":
+            return "product"
+        if task_type == "idea_brainstorm":
+            return "idea"
+        if task_type == "database":
+            return "DB"
+        if task_type == "ai_ml":
+            return "AI"
 
         # Fallback: keyword check
         if any(kw in lower for kw in _DEBUG_KW):
@@ -265,6 +285,68 @@ class OrchestratorAgent(BaseAgent):
         choice = resp.text.strip().lower()
         valid = {"build", "debug", "web", "DB", "AI", "README", "plan", "idea", "product"}
         return choice if choice in valid else "build"
+
+    # ── Task reformulation ──────────────────────────────────────────────
+
+    async def _reformulate_for_worker(
+        self, task: str, worker: str, task_type: str,
+    ) -> str:
+        """Reformulate user input into a clear, actionable instruction for the worker.
+
+        Extracts file references, clarifies intent, removes greetings/filler.
+        Falls back to original task if LLM is unavailable.
+        """
+        # Extract explicit file references from task
+        file_refs = re.findall(r'(?:в\s+(?:файл[еу]?\s+)?|in\s+(?:file\s+)?|file\s+)([`"\']?[\w./_-]+\.\w{2,}[`"\']?)', task, re.IGNORECASE)
+        file_refs += re.findall(r'`([\w./_-]+\.\w{2,})`', task)
+        file_hint = ""
+        if file_refs:
+            clean = file_refs[0].strip("`\"'")
+            file_hint = f" Target file: {clean}."
+
+        # For simple, clear tasks — just clean up and add file hint
+        if len(task) < 120 and file_refs:
+            # Remove greetings
+            cleaned = re.sub(
+                r'^(привет|hi|hello|hey|здравствуй\w*)[,!.\s]*',
+                '', task, flags=re.IGNORECASE,
+            ).strip()
+            if not cleaned:
+                cleaned = task
+            return cleaned + (f" Write the code into {file_refs[0].strip('`\"')}." if file_refs else "")
+
+        # For complex tasks, use LLM to reformulate
+        worker_roles = {
+            "build": "a code builder that writes and creates files using tools",
+            "debug": "a debugger that finds and fixes bugs in existing code",
+            "web": "a web researcher that finds documentation and information",
+            "README": "a documentation writer",
+            "plan": "a planner that creates step-by-step plans",
+            "idea": "a brainstormer for feature ideas",
+            "product": "a product analyst",
+        }
+        worker_desc = worker_roles.get(worker, f"the {worker} agent")
+
+        messages = [
+            {"role": "system", "content": (
+                f"Reformulate this user request into a clear, specific instruction "
+                f"for {worker_desc}. "
+                f"Remove greetings and filler. "
+                f"Keep file names and technical details. "
+                f"Be concise — one paragraph max.{file_hint}\n"
+                f"Reply with ONLY the reformulated instruction, nothing else."
+            )},
+            {"role": "user", "content": task},
+        ]
+        try:
+            resp = await self.invoke_llm(messages, temperature=0.1, max_tokens=300)
+            reformulated = resp.text.strip()
+            if reformulated and len(reformulated) > 10:
+                return reformulated
+        except Exception:
+            pass
+
+        return task
 
     # ── Result contract validation ─────────────────────────────────────
 

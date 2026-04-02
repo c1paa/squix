@@ -574,8 +574,8 @@ class SquixCLI:
         ``{"content": ..., "files": [...], "agent_chain": [...]}``
         """
         th = self._th()
-        overall_timeout = 120
-        step_timeout = 30
+        overall_timeout = 300  # 5 min for agentic loops
+        step_timeout = 60
         started = asyncio.get_event_loop().time()
         has_routing = False
         files_created: list[str] = []
@@ -675,6 +675,15 @@ class SquixCLI:
                         )
                         if path and path not in files_created:
                             files_created.append(path)
+                    elif skill == "edit_file":
+                        status = msg.metadata.get("result_status", "ok")
+                        color = "yellow" if status == "success" else "red"
+                        console.print(
+                            f"  [{color}]◆[/{color}] [bold]{agent_id}[/bold]"
+                            f"  edit  [{color}]{path}[/{color}]"
+                        )
+                        if path and path not in files_modified:
+                            files_modified.append(path)
                     elif skill == "patch_file":
                         console.print(
                             f"  [yellow]◆[/yellow] [bold]{agent_id}[/bold]"
@@ -683,10 +692,20 @@ class SquixCLI:
                         if path and path not in files_modified:
                             files_modified.append(path)
                     elif skill == "run_command":
-                        cmd = msg.metadata.get("path", "")  # command in path field
+                        cmd = msg.metadata.get("path", "")
                         console.print(
                             f"  [magenta]$[/magenta] [bold]{agent_id}[/bold]"
                             f"  exec  [dim]{cmd}[/dim]"
+                        )
+                    elif skill in ("run_tests", "git_status", "git_diff"):
+                        console.print(
+                            f"  [magenta]$[/magenta] [bold]{agent_id}[/bold]"
+                            f"  {skill}  [dim]{path}[/dim]"
+                        )
+                    elif skill in ("git_add", "git_commit"):
+                        console.print(
+                            f"  [green]◆[/green] [bold]{agent_id}[/bold]"
+                            f"  {skill}  [dim]{path}[/dim]"
                         )
                     else:
                         console.print(

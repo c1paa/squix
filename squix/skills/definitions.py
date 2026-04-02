@@ -25,6 +25,8 @@ class SkillDef:
     allowed_agents: list[str]
     params: list[SkillParam] = field(default_factory=list)
     is_dangerous: bool = False  # write_file, run_command etc.
+    is_read_only: bool = True
+    is_concurrent_safe: bool = True
 
 
 # ---------------------------------------------------------------------------
@@ -60,6 +62,29 @@ SKILLS: dict[str, SkillDef] = {
         ],
         allowed_agents=["build", "debug", "README"],
         is_dangerous=True,
+        is_read_only=False,
+        is_concurrent_safe=False,
+    ),
+
+    "edit_file": SkillDef(
+        name="edit_file",
+        description=(
+            "Replace exact text in a file. You MUST read_file first. "
+            "Finds old_string in the file and replaces it with new_string. "
+            "If old_string appears more than once, set replace_all=true. "
+            "Fails if old_string is not found — use read_file to check first."
+        ),
+        params=[
+            SkillParam("path", description="File to edit"),
+            SkillParam("old_string", description="Exact text to find in the file"),
+            SkillParam("new_string", description="Replacement text"),
+            SkillParam("replace_all", type="boolean", required=False,
+                       description="Replace all occurrences (default false)"),
+        ],
+        allowed_agents=["build", "debug"],
+        is_dangerous=True,
+        is_read_only=False,
+        is_concurrent_safe=False,
     ),
 
     "patch_file": SkillDef(
@@ -75,6 +100,8 @@ SKILLS: dict[str, SkillDef] = {
         ],
         allowed_agents=["build", "debug"],
         is_dangerous=True,
+        is_read_only=False,
+        is_concurrent_safe=False,
     ),
 
     "list_files": SkillDef(
@@ -116,6 +143,8 @@ SKILLS: dict[str, SkillDef] = {
         ],
         allowed_agents=["debug", "build"],
         is_dangerous=True,
+        is_read_only=False,
+        is_concurrent_safe=False,
     ),
 
     "run_tests": SkillDef(
@@ -161,6 +190,8 @@ SKILLS: dict[str, SkillDef] = {
             SkillParam("value", description="Content to store"),
         ],
         allowed_agents=["DB", "plan", "orch"],
+        is_read_only=False,
+        is_concurrent_safe=False,
     ),
 
     "load_memory": SkillDef(
@@ -183,6 +214,47 @@ SKILLS: dict[str, SkillDef] = {
             SkillParam("query", description="Search query"),
         ],
         allowed_agents=["web"],
+    ),
+
+    # ── Git operations ────────────────────────────────────────────────
+    "git_status": SkillDef(
+        name="git_status",
+        description="Show current git status (modified, staged, untracked files).",
+        params=[],
+        allowed_agents=["build", "debug", "plan", "orch"],
+    ),
+
+    "git_diff": SkillDef(
+        name="git_diff",
+        description="Show git diff of changes. Use staged=true for staged changes only.",
+        params=[
+            SkillParam("staged", type="boolean", required=False,
+                       description="Show only staged changes"),
+        ],
+        allowed_agents=["build", "debug"],
+    ),
+
+    "git_add": SkillDef(
+        name="git_add",
+        description="Stage a file for commit.",
+        params=[
+            SkillParam("path", description="File path to stage"),
+        ],
+        allowed_agents=["build", "debug"],
+        is_dangerous=True,
+        is_read_only=False,
+    ),
+
+    "git_commit": SkillDef(
+        name="git_commit",
+        description="Create a git commit with the given message.",
+        params=[
+            SkillParam("message", description="Commit message"),
+        ],
+        allowed_agents=["build", "debug"],
+        is_dangerous=True,
+        is_read_only=False,
+        is_concurrent_safe=False,
     ),
 }
 

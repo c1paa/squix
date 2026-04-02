@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
+import time
 from pathlib import Path
 from typing import Any
 
@@ -21,6 +23,8 @@ class WorkspaceManager:
         self.project_dir = project_dir.resolve()
         self.config = config or {}
         self.artifacts_dir = self.project_dir / self.config.get("artifacts_dir", ".squix/artifacts")
+        # FileReadState: track read/written files for staleness detection
+        self._file_state: dict[str, dict[str, Any]] = {}
 
     def init(self) -> None:
         """Create workspace directories."""
@@ -33,7 +37,15 @@ class WorkspaceManager:
         full = self._resolve(path)
         if not full.exists():
             raise FileNotFoundError(f"File not found: {full}")
-        return full.read_text(encoding="utf-8", errors="replace")
+        content = full.read_text(encoding="utf-8", errors="replace")
+        # Track file state for staleness detection
+        rel = str(full.relative_to(self.project_dir)) if full.is_relative_to(self.project_dir) else str(full)
+        self._file_state[rel] = {
+            "content_hash": hashlib.sha256(content.encode()).hexdigest(),
+            "mtime": full.stat().st_mtime,
+            "read_time": time.time(),
+        }
+        return content
 
     def write_file(self, path: str, content: str) -> Path:
         """Write content to a file, creating parent dirs as needed."""
@@ -41,6 +53,8 @@ class WorkspaceManager:
         full.parent.mkdir(parents=True, exist_ok=True)
         full.write_text(content, encoding="utf-8")
         logger.info("Wrote file: %s", full)
+        # Update file state after write
+        self.mark_written(path, content)
         return full
 
     def list_files(self, path: str = ".", max_depth: int = 3) -> list[str]:
@@ -114,6 +128,42 @@ class WorkspaceManager:
             ["python", "-c", code],
             timeout=timeout,
         )
+
+    # ---- File state tracking ----
+
+    def check_staleness(self, path: str) -> tuple[bool, str]:
+        """Check if a file has changed since last read.
+
+        Returns (is_stale, reason). If never read, returns (True, "not read yet").
+        """
+        full = self._resolve(path)
+        rel = str(full.relative_to(self.project_dir)) if full.is_relative_to(self.project_dir) else str(full)
+        state = self._file_state.get(rel)
+        if state is None:
+            return True, "not read yet"
+        if not full.exists():
+            return True, "file deleted"
+        current_mtime = full.stat().st_mtime
+        if current_mtime != state["mtime"]:
+            return True, f"modified on disk (mtime changed: {state['mtime']:.0f} → {current_mtime:.0f})"
+        return False, "up to date"
+
+    def mark_written(self, path: str, content: str) -> None:
+        """Update file state after a write, so subsequent staleness checks pass."""
+        full = self._resolve(path)
+        rel = str(full.relative_to(self.project_dir)) if full.is_relative_to(self.project_dir) else str(full)
+        mtime = full.stat().st_mtime if full.exists() else time.time()
+        self._file_state[rel] = {
+            "content_hash": hashlib.sha256(content.encode()).hexdigest(),
+            "mtime": mtime,
+            "read_time": time.time(),
+        }
+
+    def get_file_state(self, path: str) -> dict[str, Any] | None:
+        """Get tracked state for a file, or None if never read/written."""
+        full = self._resolve(path)
+        rel = str(full.relative_to(self.project_dir)) if full.is_relative_to(self.project_dir) else str(full)
+        return self._file_state.get(rel)
 
     def _resolve(self, path: str | Path) -> Path:
         """Resolve a path relative to the project directory."""

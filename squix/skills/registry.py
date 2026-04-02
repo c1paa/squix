@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import difflib
 import logging
 import re
 from pathlib import Path
@@ -98,10 +99,92 @@ class SkillRegistry:
         path = params["path"]
         content = params["content"]
         try:
-            written = self._workspace.write_file(path, content)
+            self._workspace.write_file(path, content)
             if self._primary:
                 self._primary.track_write(path)
-            return {"status": "success", "path": path, "lines": content.count("\n") + 1}
+            result: dict[str, Any] = {
+                "status": "success", "path": path,
+                "lines": content.count("\n") + 1,
+            }
+            # Post-write syntax check for Python files
+            syntax = await self._post_write_verify(path)
+            if syntax:
+                result["syntax_check"] = syntax
+            return result
+        except Exception as e:
+            return {"status": "error", "error": str(e), "path": path}
+
+    async def _exec_edit_file(self, params: dict[str, Any]) -> dict[str, Any]:
+        if not self._workspace:
+            return {"error": "Workspace not available"}
+        path = params["path"]
+        old_string = params["old_string"]
+        new_string = params["new_string"]
+        replace_all = params.get("replace_all", False)
+        if isinstance(replace_all, str):
+            replace_all = replace_all.lower() in ("true", "1", "yes")
+
+        try:
+            # Check staleness — file must have been read first
+            is_stale, reason = self._workspace.check_staleness(path)
+            if is_stale and reason == "not read yet":
+                return {
+                    "status": "error",
+                    "error": "You must read_file before editing. Call read_file first.",
+                    "path": path,
+                }
+
+            content = self._workspace.read_file(path)
+            count = content.count(old_string)
+
+            if count == 0:
+                # Provide close matches as hints
+                lines = content.splitlines()
+                old_lines = old_string.splitlines()
+                close = difflib.get_close_matches(
+                    old_lines[0] if old_lines else old_string,
+                    lines, n=3, cutoff=0.5,
+                )
+                hint = f" Similar lines: {close}" if close else ""
+                return {
+                    "status": "error",
+                    "error": f"old_string not found in {path}.{hint}",
+                    "path": path,
+                }
+
+            if count > 1 and not replace_all:
+                return {
+                    "status": "error",
+                    "error": (
+                        f"old_string found {count} times in {path}. "
+                        "Set replace_all=true to replace all, or provide more context to match uniquely."
+                    ),
+                    "path": path,
+                }
+
+            if replace_all:
+                new_content = content.replace(old_string, new_string)
+            else:
+                new_content = content.replace(old_string, new_string, 1)
+
+            self._workspace.write_file(path, new_content)
+            if self._primary:
+                self._primary.track_write(path)
+
+            result: dict[str, Any] = {
+                "status": "success",
+                "path": path,
+                "replacements": count if replace_all else 1,
+            }
+
+            # Post-write syntax check for Python files
+            syntax = await self._post_write_verify(path)
+            if syntax:
+                result["syntax_check"] = syntax
+            return result
+
+        except FileNotFoundError:
+            return {"status": "error", "error": f"File not found: {path}", "path": path}
         except Exception as e:
             return {"status": "error", "error": str(e), "path": path}
 
@@ -314,7 +397,54 @@ class SkillRegistry:
         query = params.get("query", "")
         return {"status": "stub", "query": query, "results":[]}
 
+    # ── Git executors ─────────────────────────────────────────────────
+
+    async def _exec_git_status(self, params: dict[str, Any]) -> dict[str, Any]:
+        if not self._workspace:
+            return {"error": "Workspace not available"}
+        rc, stdout, stderr = await self._workspace.run_command("git status --short", timeout=15)
+        return {"status": "success", "output": stdout, "returncode": rc}
+
+    async def _exec_git_diff(self, params: dict[str, Any]) -> dict[str, Any]:
+        if not self._workspace:
+            return {"error": "Workspace not available"}
+        cmd = "git diff --staged" if params.get("staged") else "git diff"
+        rc, stdout, stderr = await self._workspace.run_command(cmd, timeout=15)
+        return {"status": "success", "output": stdout[:8000], "returncode": rc}
+
+    async def _exec_git_add(self, params: dict[str, Any]) -> dict[str, Any]:
+        if not self._workspace:
+            return {"error": "Workspace not available"}
+        path = params["path"]
+        rc, stdout, stderr = await self._workspace.run_command(f"git add {path}", timeout=15)
+        if rc != 0:
+            return {"status": "error", "error": stderr, "path": path}
+        return {"status": "success", "path": path}
+
+    async def _exec_git_commit(self, params: dict[str, Any]) -> dict[str, Any]:
+        if not self._workspace:
+            return {"error": "Workspace not available"}
+        message = params["message"].replace('"', '\\"')
+        rc, stdout, stderr = await self._workspace.run_command(
+            f'git commit -m "{message}"', timeout=30
+        )
+        if rc != 0:
+            return {"status": "error", "error": stderr}
+        return {"status": "success", "output": stdout}
+
     # ── Helpers ─────────────────────────────────────────────────────────
+
+    async def _post_write_verify(self, path: str) -> str | None:
+        """Run syntax check after writing a Python file. Returns result or None."""
+        if not self._workspace or not path.endswith(".py"):
+            return None
+        full = self._workspace._resolve(path)
+        rc, stdout, stderr = await self._workspace.run_command(
+            f"python -m py_compile {full}", timeout=10,
+        )
+        if rc == 0:
+            return "ok"
+        return f"error: {stderr.strip()}"
 
     @staticmethod
     def _apply_unified_diff(original: str, diff_text: str) -> str:

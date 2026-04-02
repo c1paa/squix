@@ -191,77 +191,48 @@ class TestTaskClassification:
 class TestBuildResultContract:
     """Build agent must return structured JSON result contract."""
 
-    @pytest.fixture
-    def build_with_workspace(self, tmp_path):
-        """Create Build agent with a workspace."""
+    def test_guess_lang_py_file(self):
+        from squix.agents.built_in.build import _guess_lang
+        assert _guess_lang("main.py") == "python"
+
+    def test_guess_lang_js_file(self):
+        from squix.agents.built_in.build import _guess_lang
+        assert _guess_lang("app.js") == "javascript"
+
+    def test_guess_lang_unknown(self):
+        from squix.agents.built_in.build import _guess_lang
+        assert _guess_lang("data.txt") == "text"
+
+    def test_build_skills_defined(self):
+        """Build agent has the expected skill list."""
+        from squix.agents.built_in.build import BUILD_SKILLS
+        assert "read_file" in BUILD_SKILLS
+        assert "write_file" in BUILD_SKILLS
+        assert "edit_file" in BUILD_SKILLS
+        assert "run_command" in BUILD_SKILLS
+
+    def test_build_agent_has_agentic_loop(self):
+        """Build agent inherits run_agentic_loop from BaseAgent."""
         from squix.agents.built_in.build import BuilderAgent
-        from squix.workspace.manager import WorkspaceManager
-
-        workspace = WorkspaceManager(project_dir=tmp_path)
-        build = BuilderAgent(workspace_manager=workspace)
-        build._workspace = workspace
-        return build
-
-    def test_extract_and_write_creates_file(self, build_with_workspace, tmp_path):
-        """Extract code blocks from LLM response and write them."""
-        response = "Here's the code:\n```python\nprint('hello')\n```"
-        wrote = build_with_workspace._extract_and_write("main.py", response)
-        assert "main.py" in wrote
-        assert (tmp_path / "main.py").exists()
-
-    def test_guess_lang_py_file(self, build_with_workspace):
-        assert build_with_workspace._guess_lang("main.py") == "python"
-
-    def test_guess_lang_js_file(self, build_with_workspace):
-        assert build_with_workspace._guess_lang("app.js") == "javascript"
-
-    def test_guess_lang_unknown(self, build_with_workspace):
-        assert build_with_workspace._guess_lang("data.txt") == "text"
-
-    def test_files_created_not_modified_for_new_file(self, build_with_workspace):
-        """New files should NOT appear in files_modified."""
-        # The _is_preexisting logic was replaced with preexisting_files snapshot
-        # This test verifies the new behavior conceptually
-
-    def test_files_modified_contains_only_preexisting(self, build_with_workspace, tmp_path):
-        """files_modified should only contain files that existed before."""
-        (tmp_path / "exists.py").write_text("# old content")
+        build = BuilderAgent()
+        assert hasattr(build, "run_agentic_loop")
 
 
 class TestDebugResultContract:
     """Debug agent must return structured JSON result contract."""
 
-    @pytest.fixture
-    def debug_with_workspace(self, tmp_path):
-        """Create Debug agent with a workspace."""
+    def test_debug_skills_defined(self):
+        """Debug agent has the expected skill list."""
+        from squix.agents.built_in.debug import DEBUG_SKILLS
+        assert "read_file" in DEBUG_SKILLS
+        assert "edit_file" in DEBUG_SKILLS
+        assert "run_tests" in DEBUG_SKILLS
+
+    def test_debug_agent_has_agentic_loop(self):
+        """Debug agent inherits run_agentic_loop from BaseAgent."""
         from squix.agents.built_in.debug import DebuggerAgent
-        from squix.workspace.manager import WorkspaceManager
-
-        workspace = WorkspaceManager(project_dir=tmp_path)
-        debug = DebuggerAgent(workspace_manager=workspace)
-        debug._workspace = workspace
-
-        bug_file = tmp_path / "buggy.py"
-        bug_file.write_text("print('buggy')")
-        return debug
-
-    def test_try_parse_json_valid(self, debug_with_workspace):
-        text = json.dumps({"diagnosis": "null ref", "fix_code": "pass"})
-        result = debug_with_workspace._try_parse_json(text, {})
-        assert result.get("diagnosis") == "null ref"
-
-    def test_try_parse_json_invalid_returns_default(self, debug_with_workspace):
-        result = debug_with_workspace._try_parse_json("not json", {"default": True})
-        assert result == {"default": True}
-
-    def test_make_result_failure(self, debug_with_workspace):
-        result = debug_with_workspace._make_result(
-            status="failed", task_id="t1", error="Cannot read file",
-        )
-        assert result.recipient == "orch"
-        content = json.loads(result.content)
-        assert content["status"] == "failed"
-        assert "Cannot read file" in content["errors"]
+        debug = DebuggerAgent()
+        assert hasattr(debug, "run_agentic_loop")
 
 
 class TestCollectResults:

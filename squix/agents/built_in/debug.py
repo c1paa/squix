@@ -1,123 +1,118 @@
-"""Debugger agent — finds bugs and fixes errors.
+"""Debugger agent — finds bugs and fixes errors via agentic loop.
 
-Works through the skill layer (read_file, search_in_files, find_main_file,
-get_project_structure).  Returns a structured result contract with diagnosis,
-fix, and verification.
+Uses the agentic tool-use loop to read code, diagnose issues,
+apply targeted fixes with edit_file, and verify the result.
 """
 
 from __future__ import annotations
 
 import json
-import re
 
 from squix.agents.base import AgentMessage, BaseAgent
 
+DEBUG_SKILLS = [
+    "read_file", "write_file", "edit_file",
+    "list_files", "find_main_file", "search_in_files",
+    "run_command", "run_tests", "get_project_structure",
+    "git_status", "git_diff",
+]
+
+DEBUG_SYSTEM = """\
+You are DEBUGGER — the bug hunter of Squix.
+
+Your job is to find bugs, diagnose errors, and apply precise fixes to REAL files using tools.
+You NEVER speculate. You READ actual code, FIND the problem, and FIX it with tools.
+
+## Workflow
+
+1. **Locate** — call find_main_file / list_files / search_in_files to find relevant file(s)
+2. **Read** — call read_file to see the actual code (REQUIRED before editing)
+3. **Diagnose** — identify the root cause from the code you read
+4. **Fix** — call edit_file(old_string, new_string) for precise surgical fixes
+5. **Verify** — check syntax_check in the result; call run_tests or run_command to confirm
+6. **Iterate** — if the fix introduced a new error, read the error and fix again
+
+## CRITICAL RULES
+
+- NEVER output code as text. Always use edit_file or write_file tools.
+- ALWAYS call read_file before edit_file (edit_file requires prior read).
+- Prefer edit_file for targeted fixes — do NOT rewrite the whole file unless necessary.
+- old_string in edit_file must be an EXACT match of text in the file.
+- After fixing, verify with run_tests or run_command if possible.
+- If syntax_check shows an error, fix it immediately.
+- When DONE, respond with plain text explaining what you found and fixed (no JSON, no code blocks).
+"""
+
 
 class DebuggerAgent(BaseAgent):
-    """Finds bugs, analyzes errors, and returns diagnoses + fixes.
-
-    THINK → ACT (read files) → THINK (diagnose) → ACT (fix file) → OBSERVE (verify) → HANDOFF
-    """
+    """Finds bugs, analyzes errors, and applies fixes via agentic loop."""
 
     agent_id = "debug"
     role = (
-        "DEBUGGER — you are the bug hunter of the Squix AI system. "
-        "You READ real files, ANALYZE errors, identify root causes, and "
-        "patch files in place. "
-        "NEVER just speculate — always read the actual code first. "
-        "Use find_main_file skill to locate the relevant file. "
-        "Return a structured result contract with diagnosis + fix."
+        "DEBUGGER — bug hunter that reads code, diagnoses issues, "
+        "and applies targeted fixes using an agentic tool-use loop."
     )
 
     async def handle(self, msg: AgentMessage) -> AgentMessage | None:
         await self.set_progress(f"Debugging: {msg.content[:60]}")
         task = msg.content
-        self._session_ctx = msg.metadata.get("session_context", "")
+        session_ctx = msg.metadata.get("session_context", "")
 
-        # ─── THINK: classify problem ───
-        think_result = await self._think(task)
-
-        # ─── ACT: find target file ───
-        target_result = await self._find_target_file(task)
-        if target_result.get("status") != "success":
-            return self._make_result(
-                status="failed",
-                error=target_result.get("error", "No target file found"),
-                task_id=msg.task_id,
+        system = DEBUG_SYSTEM
+        if session_ctx:
+            system += (
+                f"\n## Session Context\n\n{session_ctx}\n"
+                "Use this to understand what the user has been working on.\n"
             )
 
-        target_path = target_result.get("path", "")
+        final_text, tool_log = await self.run_agentic_loop(
+            task=task,
+            system_prompt=system,
+            available_skills=DEBUG_SKILLS,
+            max_iterations=15,
+            temperature=0.2,
+        )
 
-        # Read the file
-        file_read = await self.invoke_skill("read_file", {"path": target_path})
-        if file_read.get("status") != "success":
-            return self._make_result(
-                status="failed",
-                error=f"Cannot read '{target_path}': {file_read.get('error', 'unknown')}",
-                task_id=msg.task_id,
-            )
+        # Analyze tool log
+        files_modified: list[str] = []
+        errors: list[str] = []
 
-        content = file_read.get("content", "")
+        for entry in tool_log:
+            tool = entry["tool"]
+            result = entry.get("result", {})
+            path = entry.get("params", {}).get("path", "")
 
-        # ─── THINK: diagnose + produce fix ───
-        diagnose = await self._analyze(task, target_path, content)
-        diagnosis_text = diagnose.get("diagnosis", "")
-        fix_code = diagnose.get("fix_code", "")
+            if tool in ("edit_file", "write_file", "patch_file"):
+                if result.get("status") == "success" and path and path not in files_modified:
+                    files_modified.append(path)
+            if result.get("status") == "error":
+                errors.append(f"{tool}: {result.get('error', 'unknown')}")
+            if result.get("syntax_check", "").startswith("error"):
+                errors.append(f"syntax: {result['syntax_check']}")
 
-        # ─── ACT: write fixed file ───
-        files_created = []
-        files_modified = []
-        file_errors = []
-
-        if fix_code:
-            if self._workspace:
-                try:
-                    self._workspace.write_file(target_path, fix_code)
-                    files_modified.append(target_path)
-                    if self._primary:
-                        self._primary.track_write(target_path)
-                except Exception as e:
-                    file_errors.append(f"Failed to write fix: {e}")
-
-            # Verify syntax
-            verify = ""
-            if self._workspace and target_path.endswith(".py"):
-                try:
-                    rc, stdout, stderr = await self._workspace.run_command(
-                        ["python", "-m", "py_compile", target_path],
-                        timeout=10,
-                    )
-                    if rc == 0:
-                        verify = "✓ Syntax check passed"
-                    else:
-                        verify = f"✗ Syntax error: {stderr.strip()[:200]}"
-                except Exception as e:
-                    verify = f"Verification failed: {e}"
-
-        # ─── HANDOFF: structured result contract ───
-        next_steps = [f"Run: python {target_path}"] if target_path.endswith(".py") else []
-        user_msg = (
-            f"Нашёл и исправил багу в `{target_path}`.\n\n"
-            f"**Диагноз:** {diagnosis_text[:300]}\n\n"
-            f"**Проверка:** {verify}"
-            if fix_code else
-            f"**Диагноз:** {diagnosis_text}\n\n"
-            "Автоматический фикс не был применён. См. анализ выше."
+        status = "success" if files_modified else ("partial" if not errors else "failed")
+        summary = (
+            f"Fixed {len(files_modified)} file(s): {', '.join(f'`{f}`' for f in files_modified)}"
+            if files_modified else final_text[:200]
         )
 
         result_json = {
-            "status": "success" if fix_code else "partial",
+            "status": status,
             "task_type": "debug",
-            "summary": f"Diagnosed and patched `{target_path}`",
-            "files_created": files_created,
+            "summary": summary,
+            "files_created": [],
             "files_modified": files_modified,
             "artifacts": [
-                {"type": "fix_patch", "path": target_path, "diagnosis": diagnosis_text[:300]},
+                {"type": "fix_patch", "path": f}
+                for f in files_modified
             ],
-            "user_message": user_msg,
-            "next_steps": next_steps,
-            "errors": file_errors,
+            "user_message": final_text,
+            "next_steps": [f"Run: python {f}" for f in files_modified if f.endswith(".py")],
+            "errors": errors,
+            "iterations": len(set(e["iteration"] for e in tool_log)) if tool_log else 0,
         }
+
+        await self.set_progress(f"Done: fixed {len(files_modified)} file(s)")
 
         return AgentMessage(
             sender=self.agent_id,
@@ -126,126 +121,8 @@ class DebuggerAgent(BaseAgent):
             task_id=msg.task_id,
             metadata={
                 "type": "work",
-                "status": "success" if fix_code else "partial",
-                "files_created": files_created,
-                "files_modified": files_modified,
-            },
-        )
-
-    # ─── THINK ─────────────────────────────────────────────────────────
-
-    async def _think(self, task: str) -> dict:
-        messages = [
-            {"role": "system", "content": (
-                "You are a debugger classifier. Given a user message about a code issue, "
-                "classify it. Respond with JSON ONLY:\n"
-                '{"type": "error|bug|improvement|investigation", '
-                '"likely_files": ["files that might be relevant"], '
-                '"description": "brief problem summary"}'
-            )},
-            {"role": "user", "content": task},
-        ]
-        resp = await self.invoke_llm(messages, temperature=0.3)
-        return self._try_parse_json(
-            resp.text,
-            {"type": "investigation", "likely_files": [], "description": task},
-        )
-
-    # ─── ACT: find file ────────────────────────────────────────────────
-
-    async def _find_target_file(self, task: str) -> dict:
-        # Primary tracker
-        if self._primary:
-            pf = self._primary.get_primary()
-            if pf:
-                return {"status": "success", "path": pf, "reason": "primary_tracker"}
-
-        # File references in task text
-        refs = re.findall(r'(?:`([\w./_\\-]+)`|([\w./_\\-]+\.\w{2,}))', task)
-        for bare, quoted in refs:
-            ref = (quoted or bare).replace("\\", "/")
-            if self._workspace and (self._workspace.project_dir / ref).exists():
-                return {"status": "success", "path": ref, "reason": "mentioned_in_task"}
-
-        # find_main_file skill
-        result = await self.invoke_skill("find_main_file")
-        if result.get("status") == "success" and result.get("path"):
-            return result
-
-        # Project structure scan
-        struct = await self.invoke_skill("get_project_structure")
-        if struct.get("status") == "success":
-            files = struct.get("structure", "").split("\n")
-            for f in files:
-                if any(f.endswith(e) for e in (".py", ".js", ".ts", ".go")):
-                    return {"status": "success", "path": f, "reason": "first_source"}
-
-        return {"status": "error", "error": "No source file found in project"}
-
-    # ─── THINK: analyze ────────────────────────────────────────────────
-
-    async def _analyze(self, task: str, path: str, content: str) -> dict:
-        ctx = getattr(self, "_session_ctx", "")
-        ctx_block = ""
-        if ctx:
-            ctx_block = f"\n\nSession context:\n{ctx}\n"
-        messages = [
-            {"role": "system", "content": (
-                "You are a senior debugger. Given the real file content and a problem "
-                "description, identify the root cause and produce the fixed version.\n\n"
-                f"{ctx_block}"
-                "Respond with JSON ONLY:\n"
-                '{"diagnosis": "clear explanation of the bug and root cause", '
-                '"fix_code": "the COMPLETE fixed file content, ready to be written"}\n\n'
-                "The fix_code must be the ENTIRE file — not a diff. "
-                "Everything not changed must still be included."
-            )},
-            {"role": "user", "content": f"PROBLEM: {task}\n\nFILE: {path}\n```{content}\n```"},
-        ]
-        resp = await self.invoke_llm(messages, temperature=0.1)
-        return self._try_parse_json(resp.text, {"diagnosis": resp.text, "fix_code": ""})
-
-    # ─── Helpers ───────────────────────────────────────────────────────
-
-    @staticmethod
-    def _try_parse_json(text: str, default: dict) -> dict:
-        text = text.strip()
-        if "```" in text:
-            for part in text.split("```"):
-                part = part.strip()
-                if part.startswith("json"):
-                    part = part[4:].strip()
-                if part.startswith("{"):
-                    try:
-                        return json.loads(part)
-                    except json.JSONDecodeError:
-                        pass
-        if text.startswith("{"):
-            try:
-                return json.loads(text)
-            except json.JSONDecodeError:
-                pass
-        return default
-
-    def _make_result(self, status: str, task_id: str, error: str) -> AgentMessage:
-        result_json = {
-            "status": status,
-            "summary": error,
-            "files_created": [],
-            "files_modified": [],
-            "artifacts": [],
-            "user_message": f"Не удалось выполнить отладку: {error}",
-            "next_steps": [],
-            "errors": [error],
-        }
-        return AgentMessage(
-            sender=self.agent_id, recipient="orch",
-            content=json.dumps(result_json, indent=2),
-            task_id=task_id,
-            metadata={
-                "type": "work", "status": status,
-                "error": status == "failed",
+                "status": status,
                 "files_created": [],
-                "files_modified": [],
+                "files_modified": files_modified,
             },
         )
